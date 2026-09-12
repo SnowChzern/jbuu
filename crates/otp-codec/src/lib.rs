@@ -215,7 +215,7 @@ mod tests {
         let hello = Message::Hello {
             version: ProtocolVersion(2),
             book_id: BookId::from_bytes([7; 16]),
-            client_nonce: ClientNonce::from_bytes([0; 32]),
+            client_nonce: ClientNonce::from_bytes([0; 16]), // WP-01 §4.1 冻结：BYTES(16)（otp-types 同步修正）
             client_pointer: SegmentIndex::ZERO,
             features: FeatureFlags::default(),
         };
