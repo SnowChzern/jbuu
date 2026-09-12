@@ -1,0 +1,20 @@
+[package]
+name = "otp-cli"
+description = "OTP 终端协议：运维 CLI（serve/connect/book/anchor/doctor/drain/rotate）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "otp-term"
+path = "src/main.rs"
+
+[dependencies]
+otp-types.workspace = true
+otp-terminal.workspace = true
+otp-recovery.workspace = true
+otp-book.workspace = true
+otp-platform.workspace = true
+clap.workspace = true

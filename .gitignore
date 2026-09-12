@@ -1,0 +1,15 @@
+# 构建产物
+/target
+
+# 秘密与证据文件（规划 §6.1：禁止提交真实密码本、锚、core、流量明文）
+*.book
+*.anchor
+core*
+core
+evidence/
+*.log
+*.tmp
+*.swp
+
+# 环境噪音
+.DS_Store

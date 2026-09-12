@@ -1,0 +1,26 @@
+# CODEOWNERS —— otp-term 协作仓（文档性质；本集群 git 服务器暂无平台级强制，
+# 评审纪律依据实现规划 §6.1 / §4.1，由调度与审计在 merge 前人工执行）
+# 账号对应：@principal=栋梁 @architect=斗拱 @engineer=榫卯 @security=安全审计
+
+# 默认负责人：改动作者所在角色，至少 1 名非作者 review
+* @principal @architect @engineer
+
+# ── 高危路径：栋梁 + 安全审计 双批准（至少 2 人，其中 1 人非作者）──
+# 段分配器 / 崩溃恢复 / AEAD 会话层：错误即段复用（“死刑级”），
+# 禁止榫卯单独修改（规划 §4.1）
+/crates/otp-allocator/   @principal @security
+/crates/otp-recovery/    @principal @security
+/crates/otp-session/     @principal @security
+
+# 协议语义冻结面：斗拱规格 + 栋梁裁决
+/crates/otp-anchor-spec/ @architect @principal
+/crates/otp-codec/       @architect @principal
+/docs/specs/             @architect @principal
+/docs/design-defects/    @architect @principal @security
+
+# 供应链基线：锁文件与依赖/工具链变更
+/Cargo.lock          @principal @engineer
+/Cargo.toml          @principal @engineer
+/rust-toolchain.toml @principal @engineer
+/deny.toml           @principal @security
+/scripts/            @principal @engineer

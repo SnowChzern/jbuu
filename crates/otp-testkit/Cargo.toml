@@ -1,0 +1,17 @@
+[package]
+name = "otp-testkit"
+description = "OTP 终端协议：测试基础设施（测试本、故障注入后端、loopback、崩溃控制、oracle）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+otp-types.workspace = true
+otp-book.workspace = true
+otp-anchor-spec.workspace = true
+otp-allocator.workspace = true
+otp-transport.workspace = true
+getrandom.workspace = true
+proptest.workspace = true

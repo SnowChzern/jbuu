@@ -1,0 +1,15 @@
+[package]
+name = "otp-handshake"
+description = "OTP 终端协议：客/服握手状态机与指针仲裁（只能经 SegmentIssuer 取段）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+otp-types.workspace = true
+otp-codec.workspace = true
+otp-session.workspace = true
+otp-allocator.workspace = true
+getrandom.workspace = true
