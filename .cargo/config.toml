@@ -1,0 +1,12 @@
+# rsproxy 国内镜像（字节维护）——沙箱直连快，避免 crates.io 超时烧轮次
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
