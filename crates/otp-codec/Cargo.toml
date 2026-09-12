@@ -1,6 +1,6 @@
 [package]
 name = "otp-codec"
-description = "OTP 终端协议：HELLO/ARBITRATE/ISSUE/CONFIRM/DATA 严格长度前缀二进制编解码"
+description = "OTP 终端协议：HELLO/ARBITRATE/ISSUE/CONFIRM/DATA 严格长度前缀二进制编解码（WP-01 冻结线格式的唯一实现）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,7 @@ publish.workspace = true
 
 [dependencies]
 otp-types.workspace = true
+
+[dev-dependencies]
+# 性质测试（规划 §1.2：解析器 proptest；WP-05 往返/垃圾输入/变异性质）
+proptest.workspace = true

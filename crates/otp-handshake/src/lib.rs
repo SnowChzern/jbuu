@@ -17,7 +17,7 @@
 #![forbid(unsafe_code)]
 
 use otp_allocator::{IssueError, SegmentIssuer};
-use otp_codec::{CodecError, Message, ProtocolVersion};
+use otp_codec::{ErrorCode, Message, ProtocolVersion};
 use otp_session::{Session, SessionError};
 use otp_types::{BookId, SegmentIndex};
 
@@ -136,8 +136,8 @@ pub enum HandshakeError {
     Exhausted,
     /// 确认 tag 验证失败：隐式认证失败，会话终止。
     AuthenticationFailed,
-    /// 消息解码失败。
-    Codec(CodecError),
+    /// 消息解码失败（统一错误码，WP-01 §5.2）。
+    Codec(ErrorCode),
     /// 段签发失败。
     Issuer(IssueError),
     /// 会话层错误。

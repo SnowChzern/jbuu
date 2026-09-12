@@ -202,12 +202,13 @@ impl<const N: usize> fmt::Debug for Nonce<N> {
     }
 }
 
-/// HELLO 中的客户端 nonce（32 字节）。
-pub type ClientNonce = Nonce<32>;
-/// ARBITRATE 中的服务端 nonce（32 字节）。
-pub type ServerNonce = Nonce<32>;
-/// 会话级 nonce（32 字节；进入 AAD 与 96-bit nonce 域）。
-pub type SessionNonce = Nonce<32>;
+/// HELLO 中的客户端 nonce（16 字节；WP-01 §4.1 冻结：BYTES(16)）。
+pub type ClientNonce = Nonce<16>;
+/// ARBITRATE 中的服务端 nonce（16 字节；WP-01 §4.2 决策 D2）。
+pub type ServerNonce = Nonce<16>;
+/// 会话级 nonce（16 字节；= client_nonce ⊕ server_nonce，WP-01 决策 D3；
+/// 是否进入 96-bit nonce 域由 WP-03 定义）。
+pub type SessionNonce = Nonce<16>;
 /// AEAD 96-bit nonce。
 pub type Nonce96 = Nonce<12>;
 
