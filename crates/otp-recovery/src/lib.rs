@@ -77,12 +77,12 @@ mod tests {
     #[test]
     fn report_only_carries_public_metadata() {
         let r = RecoveryReport {
-            adopted: AnchorRecord {
-                book_id: otp_types::BookId::from_bytes([0; 16]),
-                next: otp_types::SegmentIndex::new(1),
-                generation: otp_types::Generation::new(1),
-                previous_segment_hash: otp_anchor_spec::SegmentHash([0; 32]),
-            },
+            adopted: AnchorRecord::commit(
+                otp_types::BookId::from_bytes([0; 16]),
+                otp_types::Generation::new(1),
+                otp_types::SegmentIndex::new(1),
+                otp_anchor_spec::SegmentHash([0; 32]),
+            ),
             repaired: Some(AnchorCopy::B),
             quarantined: vec![],
             warnings: vec![RecoveryWarning::StaleCopyRepaired {
