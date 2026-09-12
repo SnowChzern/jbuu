@@ -405,8 +405,34 @@ fn map_platform(error: PlatformError) -> IssueError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const ID: BookId = BookId::from_bytes(*b"OTPTERM-TESTBOOK");
+
+    const ALL_BOUNDARIES: [Boundary; 17] = [
+        Boundary::IntentAWriteStart,
+        Boundary::IntentAWriteComplete,
+        Boundary::IntentAFsyncStart,
+        Boundary::IntentAFsyncReturn,
+        Boundary::IntentBWriteStart,
+        Boundary::IntentBWriteComplete,
+        Boundary::IntentBFsyncStart,
+        Boundary::IntentBFsyncReturn,
+        Boundary::SegmentPread,
+        Boundary::FinalAWriteStart,
+        Boundary::FinalAWriteComplete,
+        Boundary::FinalAFsyncStart,
+        Boundary::FinalAFsyncReturn,
+        Boundary::FinalBWriteStart,
+        Boundary::FinalBWriteComplete,
+        Boundary::FinalBFsyncStart,
+        Boundary::FinalBFsyncReturn,
+    ];
 
     #[derive(Clone)]
     struct MemoryMedia {
@@ -497,6 +523,93 @@ mod tests {
         TransactionCore::open(media, reader, ID).unwrap()
     }
 
+    struct KillMedia {
+        inner: FileMedia,
+        kill_at: Boundary,
+        marker: PathBuf,
+    }
+
+    impl AnchorMedia for KillMedia {
+        fn read(&mut self, copy: AnchorCopy) -> Result<Vec<u8>, MediaError> {
+            self.inner.read(copy)
+        }
+
+        fn write(&mut self, copy: AnchorCopy, bytes: &[u8]) -> Result<(), MediaError> {
+            self.inner.write(copy, bytes)
+        }
+
+        fn sync(&mut self, copy: AnchorCopy) -> Result<(), MediaError> {
+            self.inner.sync(copy)
+        }
+
+        fn boundary(&mut self, point: Boundary) -> Result<(), MediaError> {
+            if point == self.kill_at {
+                let mut marker = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.marker)
+                    .map_err(|_| MediaError::Io)?;
+                writeln!(marker, "{point:?}").map_err(|_| MediaError::Io)?;
+                marker.sync_all().map_err(|_| MediaError::Persistence)?;
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct FileSegmentReader {
+        file: File,
+        count: u64,
+    }
+
+    impl SegmentReader for FileSegmentReader {
+        fn segment_count(&self) -> u64 {
+            self.count
+        }
+
+        fn read(&mut self, index: SegmentIndex) -> Result<[u8; SEGMENT_LEN], MediaError> {
+            let mut body = [0; SEGMENT_LEN];
+            self.file
+                .read_exact_at(&mut body, 128 + index.get() * SEGMENT_LEN as u64)
+                .map_err(|_| MediaError::Io)?;
+            Ok(body)
+        }
+    }
+
+    fn file_reader(path: &Path, count: u64) -> FileSegmentReader {
+        FileSegmentReader {
+            file: File::open(path).unwrap(),
+            count,
+        }
+    }
+
+    fn write_initial_files(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut anchor = Vec::new();
+        encode_record(&AnchorRecord::init(ID), &mut anchor);
+        for name in ["a.anchor", "b.anchor"] {
+            let file = File::create(dir.join(name)).unwrap();
+            (&file).write_all(&anchor).unwrap();
+            file.sync_all().unwrap();
+        }
+        let file = File::create(dir.join("segments.bin")).unwrap();
+        let header = otp_book::header::BookHeader::new(ID, 3).unwrap().encode();
+        (&file).write_all(&header).unwrap();
+        for value in 0..3u8 {
+            (&file).write_all(&[value; SEGMENT_LEN]).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    fn boundary_from_name(name: &str) -> Boundary {
+        ALL_BOUNDARIES
+            .into_iter()
+            .find(|point| format!("{point:?}") == name)
+            .unwrap()
+    }
+
     #[test]
     fn exact_transaction_trace_and_committed_only_output() {
         let (media, reader) = MemoryMedia::initialized(2);
@@ -530,26 +643,7 @@ mod tests {
 
     #[test]
     fn every_boundary_failure_is_fail_closed_and_reserved_segment_is_not_reused() {
-        let points = [
-            Boundary::IntentAWriteStart,
-            Boundary::IntentAWriteComplete,
-            Boundary::IntentAFsyncStart,
-            Boundary::IntentAFsyncReturn,
-            Boundary::IntentBWriteStart,
-            Boundary::IntentBWriteComplete,
-            Boundary::IntentBFsyncStart,
-            Boundary::IntentBFsyncReturn,
-            Boundary::SegmentPread,
-            Boundary::FinalAWriteStart,
-            Boundary::FinalAWriteComplete,
-            Boundary::FinalAFsyncStart,
-            Boundary::FinalAFsyncReturn,
-            Boundary::FinalBWriteStart,
-            Boundary::FinalBWriteComplete,
-            Boundary::FinalBFsyncStart,
-            Boundary::FinalBFsyncReturn,
-        ];
-        for point in points {
+        for point in ALL_BOUNDARIES {
             let (media, reader) = MemoryMedia::initialized(3);
             let mut core = restart(media, reader);
             core.media.fail = Some((point, MediaError::Io));
@@ -575,6 +669,84 @@ mod tests {
                 assert_eq!(rebooted.current.next.get(), 2, "{point:?}");
             }
         }
+    }
+
+    #[test]
+    fn kill_boundary_child() {
+        let Ok(dir) = std::env::var("OTP_ALLOCATOR_KILL_DIR") else {
+            return;
+        };
+        let point = boundary_from_name(&std::env::var("OTP_ALLOCATOR_KILL_POINT").unwrap());
+        let dir = PathBuf::from(dir);
+        let media = KillMedia {
+            inner: FileMedia::open(&dir.join("a.anchor"), &dir.join("b.anchor")).unwrap(),
+            kill_at: point,
+            marker: dir.join("reached"),
+        };
+        let reader = file_reader(&dir.join("segments.bin"), 3);
+        let mut core = TransactionCore::open(media, reader, ID).unwrap();
+        let _ = core.issue();
+        panic!("kill boundary was not reached: {point:?}");
+    }
+
+    #[test]
+    fn sigkill_at_every_boundary_recovers_without_reusing_observable_reservation() {
+        let root =
+            std::env::temp_dir().join(format!("otp-allocator-kill-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        for point in ALL_BOUNDARIES {
+            let dir = root.join(format!("{point:?}"));
+            write_initial_files(&dir);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::kill_boundary_child", "--nocapture"])
+                .env("OTP_ALLOCATOR_KILL_DIR", &dir)
+                .env("OTP_ALLOCATOR_KILL_POINT", format!("{point:?}"))
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !dir.join("reached").exists() {
+                assert!(Instant::now() < deadline, "child did not reach {point:?}");
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited at {point:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                Command::new("kill")
+                    .args(["-9", &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(child.wait().unwrap().signal(), Some(9), "{point:?}");
+
+            let media = FileMedia::open(&dir.join("a.anchor"), &dir.join("b.anchor")).unwrap();
+            let reader = file_reader(&dir.join("segments.bin"), 3);
+            let mut recovered = TransactionCore::open(media, reader, ID).unwrap();
+            let recovered_next = recovered.current.next.get();
+            if point == Boundary::IntentAWriteStart {
+                assert_eq!(recovered_next, 0, "pre-write kill must be a no-op");
+            } else {
+                assert!(
+                    recovered_next >= 1,
+                    "observable reservation reused at {point:?}"
+                );
+            }
+            let issued = recovered.issue().unwrap();
+            assert_eq!(issued.as_bytes()[0], recovered_next as u8, "{point:?}");
+            assert_eq!(
+                recovered.current.next.get(),
+                recovered_next + 1,
+                "{point:?}"
+            );
+            println!(
+                "KILL_TRACE point={point:?} signal=9 recovered_next={recovered_next} next_after_issue={}",
+                recovered.current.next.get()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
