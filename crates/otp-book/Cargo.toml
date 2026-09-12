@@ -11,3 +11,7 @@ publish.workspace = true
 otp-types.workspace = true
 rustix.workspace = true
 zeroize.workspace = true
+# 测试本生成：OS CSPRNG（失败即终止，设计书 §3/§9）
+getrandom.workspace = true
+# 仅两处：文件头完整性元数据 + inspect 工具全段去重（工程哈希，不进密钥派生）
+sha2.workspace = true
