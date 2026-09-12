@@ -6,13 +6,17 @@
 //! 禁止事项（规划 §2）：默认不打印秘密（book/anchor inspect 只输出公开
 //! 元数据）；危险操作要求显式确认/双人流程接口。
 //!
-//! 本骨架（WP-04）只固定命令面与参数形状；业务实现见 WP-15。
+//! 已落地（WP-06）：`book generate`（CSPRNG 测试本生成，规划 §5 测试 1）
+//! 与 `book inspect`（头校验/统计/重复段/全零段检测）。其余子命令业务
+//! 实现见 WP-15。
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use otp_book::generate::{generate_book, random_book_id};
+use otp_types::BookId;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,14 +79,20 @@ enum BookCmd {
     Inspect {
         /// 密码本路径。
         path: PathBuf,
+        /// 输出机器可读 JSON（公开元数据，无段材料；可入 evidence/）。
+        #[arg(long)]
+        json: bool,
     },
-    /// 生成测试密码本（仅测试；受控环境）。
+    /// 生成测试密码本（仅测试；受控环境；OS CSPRNG，拒绝覆盖已有文件）。
     Generate {
-        /// 输出路径。
+        /// 输出路径（O_EXCL：已存在即拒绝）。
         path: PathBuf,
-        /// 段数。
+        /// 段数（1..=2^40-1）。
         #[arg(long)]
         segments: u64,
+        /// 指定 book_id（32 位十六进制；缺省由 CSPRNG 随机生成）。
+        #[arg(long)]
+        book_id: Option<String>,
     },
 }
 
@@ -100,6 +110,12 @@ enum AnchorCmd {
 enum CliError {
     /// 子命令尚未实现（对应工作包）。
     NotImplemented(&'static str),
+    /// 密码本检查未通过（重复段/全零段等；退出码 1，供 CI/脚本判定）。
+    BookCheckFailed,
+    /// 参数非法（如 book_id 不是 32 位十六进制）。
+    BadArg(String),
+    /// 业务执行错误（底层错误已格式化为不含秘密的消息）。
+    Failed(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -108,6 +124,11 @@ impl std::fmt::Display for CliError {
             Self::NotImplemented(wp) => {
                 write!(f, "该子命令尚未实现（将于 {wp} 落地）")
             }
+            Self::BookCheckFailed => {
+                write!(f, "密码本检查未通过（重复段/全零段等，见上方报告）")
+            }
+            Self::BadArg(why) => write!(f, "参数非法：{why}"),
+            Self::Failed(what) => write!(f, "{what}"),
         }
     }
 }
@@ -121,9 +142,79 @@ fn main() {
 }
 
 fn run(cmd: Cmd) -> Result<(), CliError> {
-    // 骨架：固定命令面；业务实现于 WP-15（client/server/doctor 等）。
-    let _ = cmd;
-    Err(CliError::NotImplemented("WP-15"))
+    match cmd {
+        Cmd::Book { cmd } => run_book(cmd),
+        // 其余子命令业务实现于 WP-15（client/server/doctor 等）。
+        Cmd::Serve { .. }
+        | Cmd::Connect { .. }
+        | Cmd::Anchor { .. }
+        | Cmd::Doctor
+        | Cmd::Drain
+        | Cmd::Rotate => Err(CliError::NotImplemented("WP-15")),
+    }
+}
+
+fn run_book(cmd: BookCmd) -> Result<(), CliError> {
+    match cmd {
+        BookCmd::Generate {
+            path,
+            segments,
+            book_id,
+        } => {
+            let id = match book_id {
+                Some(hex) => parse_book_id(&hex)?,
+                None => random_book_id().map_err(|e| CliError::Failed(e.to_string()))?,
+            };
+            let header =
+                generate_book(&path, segments, id).map_err(|e| CliError::Failed(e.to_string()))?;
+            println!("已生成测试密码本（OS CSPRNG，已 fsync 文件与父目录）：");
+            println!("  path          : {}", path.display());
+            println!("  book_id       : {}", hex(header.book_id.as_bytes()));
+            println!("  version       : {}", header.version);
+            println!("  segment_len   : {}", header.segment_len);
+            println!("  segment_count : {}", header.segment_count);
+            println!(
+                "  file_size     : {}",
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+            );
+            Ok(())
+        }
+        BookCmd::Inspect { path, json } => {
+            let report = otp_book::inspect::inspect_book(&path)
+                .map_err(|e| CliError::Failed(e.to_string()))?;
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                println!("{}", report.summary());
+            }
+            if report.ok {
+                Ok(())
+            } else {
+                Err(CliError::BookCheckFailed)
+            }
+        }
+    }
+}
+
+fn parse_book_id(hex: &str) -> Result<BookId, CliError> {
+    let bytes = hex_parse(hex)
+        .ok_or_else(|| CliError::BadArg(format!("--book-id 须为 32 位十六进制，得到 {hex:?}")))?;
+    Ok(BookId::from_bytes(bytes))
+}
+
+fn hex_parse(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -163,6 +254,87 @@ mod tests {
                 cmd: BookCmd::Generate { .. }
             }
         ));
+
+        let cli = Cli::try_parse_from([
+            "otp-term",
+            "book",
+            "generate",
+            "out.book",
+            "--segments",
+            "3",
+            "--book-id",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .expect("book generate --book-id 可解析");
+        assert!(matches!(
+            cli.command,
+            Cmd::Book {
+                cmd: BookCmd::Generate {
+                    book_id: Some(_),
+                    ..
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["otp-term", "book", "inspect", "b.book", "--json"])
+            .expect("book inspect --json 可解析");
+        assert!(matches!(
+            cli.command,
+            Cmd::Book {
+                cmd: BookCmd::Inspect { json: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn book_generate_and_inspect_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("otp-cli-it-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("e2e.book");
+        let _ = std::fs::remove_file(&book);
+
+        run(Cmd::Book {
+            cmd: BookCmd::Generate {
+                path: book.clone(),
+                segments: 256,
+                book_id: Some("00112233445566778899aabbccddeeff".to_string()),
+            },
+        })
+        .expect("生成 256 段测试本");
+
+        run(Cmd::Book {
+            cmd: BookCmd::Inspect {
+                path: book.clone(),
+                json: false,
+            },
+        })
+        .expect("干净本 inspect 应 ok");
+
+        // 注入重复段：把段 0 复制到段 100 → inspect 必须失败（退出码 1 语义）
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&book)
+            .unwrap();
+        let mut seg0 = [0u8; 64];
+        f.seek(SeekFrom::Start(128)).unwrap();
+        f.read_exact(&mut seg0).unwrap();
+        f.seek(SeekFrom::Start(128 + 100 * 64)).unwrap();
+        f.write_all(&seg0).unwrap();
+        drop(f);
+
+        let err = run(Cmd::Book {
+            cmd: BookCmd::Inspect {
+                path: book.clone(),
+                json: true,
+            },
+        })
+        .expect_err("注入重复段后 inspect 必须失败");
+        assert!(matches!(err, CliError::BookCheckFailed));
+
+        std::fs::remove_file(&book).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
