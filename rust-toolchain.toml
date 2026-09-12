@@ -1,0 +1,6 @@
+# WP-04：固定稳定版工具链（规划 §1.1“提交 rust-toolchain.toml 固定工具链”）。
+# 升级工具链需单独评审：同时更新 Cargo.lock 并全量重跑 scripts/quality-gate.sh。
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

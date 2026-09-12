@@ -1,0 +1,46 @@
+# otp-term workspace —— 实现规划 §2 的 14 个 crate（任务 #33 / WP-04 骨架）。
+# 模块职责、依赖方向与禁止事项见 docs/specs/wp-04-rust-workspace-baseline.md。
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# 依赖基线（规划 §1.2）。版本区间在此统一声明，精确版本由 Cargo.lock 锁定；
+# 升级依赖 = 更新 Cargo.lock 并过质量门（scripts/quality-gate.sh）。
+[workspace.dependencies]
+# 内部 crate（路径依赖，依赖方向受规划 §2.1 依赖图约束）
+otp-types = { path = "crates/otp-types", version = "0.1.0" }
+otp-codec = { path = "crates/otp-codec", version = "0.1.0" }
+otp-book = { path = "crates/otp-book", version = "0.1.0" }
+otp-anchor-spec = { path = "crates/otp-anchor-spec", version = "0.1.0" }
+otp-allocator = { path = "crates/otp-allocator", version = "0.1.0" }
+otp-recovery = { path = "crates/otp-recovery", version = "0.1.0" }
+otp-handshake = { path = "crates/otp-handshake", version = "0.1.0" }
+otp-session = { path = "crates/otp-session", version = "0.1.0" }
+otp-transport = { path = "crates/otp-transport", version = "0.1.0" }
+otp-terminal = { path = "crates/otp-terminal", version = "0.1.0" }
+otp-platform = { path = "crates/otp-platform", version = "0.1.0" }
+otp-cli = { path = "crates/otp-cli", version = "0.1.0" }
+otp-testkit = { path = "crates/otp-testkit", version = "0.1.0" }
+
+# 系统调用（pread/fsync/文件锁/目录同步；业务层禁散落裸 unsafe，规划 §1.2）
+rustix = { version = "1.0", default-features = false, features = ["std", "fs"] }
+# AEAD：RustCrypto ChaCha20-Poly1305（仅会话层，不用于对段做任何派生）
+chacha20poly1305 = "0.10"
+# 随机数：OS CSPRNG；失败即终止握手
+getrandom = "0.3"
+# 敏感内存清零与受控暴露（derive 特性用于 ZeroizeOnDrop 派生）
+zeroize = { version = "1.8", features = ["derive"] }
+secrecy = "0.10"
+# 哈希锚：仅 previous_segment_hash 完整性锚，不进会话密钥派生
+sha2 = "0.10"
+# 测试：性质测试（解析器/状态机）
+proptest = "1.7"
+# CLI 参数解析（otp-cli）
+clap = { version = "4.5", features = ["derive", "std"] }

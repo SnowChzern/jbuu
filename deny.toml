@@ -1,0 +1,45 @@
+# cargo-deny 配置（WP-04 依赖基线）。运行：cargo deny check
+# 质量门默认跑 licenses/bans/sources；advisories 需要联网拉漏洞库，
+# 由 scripts/quality-gate.sh 在 DENY_ADVISORIES=1 时附加。
+
+[graph]
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+all-features = true
+
+[advisories]
+version = 2
+# yanked 依赖一律拒绝（供应链纪律）
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+
+[licenses]
+version = 2
+# workspace 内部 crate 不做许可检查（publish = false）
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+]
+# 新增许可须附理由并过 CODEOWNERS 供应链评审；未遇到项会被警告提醒清理。
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# rsproxy 是 crates.io 的替换镜像（.cargo/config.toml），两者都放行
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://rsproxy.cn/index/",
+]
+allow-git = []

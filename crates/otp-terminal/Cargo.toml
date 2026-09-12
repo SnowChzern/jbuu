@@ -1,0 +1,14 @@
+[package]
+name = "otp-terminal"
+description = "OTP 终端协议：PTY 终端会话（单主 lease、窗口/退出码、恢复新签发段）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+otp-types.workspace = true
+otp-handshake.workspace = true
+otp-session.workspace = true
+otp-transport.workspace = true
