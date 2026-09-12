@@ -10,3 +10,4 @@ publish.workspace = true
 [dependencies]
 otp-types.workspace = true
 rustix.workspace = true
+libc = "0.2"

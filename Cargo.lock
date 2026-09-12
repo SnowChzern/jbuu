@@ -406,6 +406,7 @@ dependencies = [
 name = "otp-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "otp-types",
  "rustix",
 ]
