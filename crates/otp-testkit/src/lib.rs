@@ -100,9 +100,12 @@ pub struct LoopbackPair {
     pub server: otp_transport::LoopbackTransport,
 }
 
-/// 创建一对互通的回环传输。
+/// 创建一对互通的回环传输（WP-12 落地：委托传输层默认容量构造；
+/// 需要旁路字节记录/有界容量背压时直接用
+/// `otp_transport::LoopbackTransport::new_pair_tapped/_bounded`）。
 pub fn loopback_pair() -> LoopbackPair {
-    todo!("WP-12/WP-13")
+    let (client, server) = otp_transport::LoopbackTransport::new_pair();
+    LoopbackPair { client, server }
 }
 
 /// 进程崩溃控制器：子进程在命名 failpoint 向父进程发“已到达”事件，

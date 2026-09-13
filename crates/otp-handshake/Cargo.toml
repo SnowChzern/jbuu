@@ -13,3 +13,17 @@ otp-codec.workspace = true
 otp-session.workspace = true
 otp-allocator.workspace = true
 getrandom.workspace = true
+
+# 以下仅测试/架构证明使用（不进生产依赖；tests/architecture.rs 以文本
+# 断言 [dependencies] 段不含密码本/锚两个 crate 名）：
+# - 密码本/锚 crate：构造测试密码本与 INIT 锚文件，驱动真实 Allocator
+#   走完整 fail-to-waste 事务（CommittedSegment 只能由它产出）；
+# - otp-testkit：IssueOracle（索引全局唯一/指针不回退 oracle）；
+# - trybuild：compile-fail 架构夹具（E0624，同任务 #45 密码本 crate 方式）；
+# - proptest：任意消息流性质测试。
+[dev-dependencies]
+otp-book.workspace = true
+otp-anchor-spec.workspace = true
+otp-testkit.workspace = true
+trybuild = "1.0"
+proptest.workspace = true

@@ -1,0 +1,10 @@
+error[E0624]: method `read_segment` is private
+ --> tests/ui/raw_segment_access.rs:9:24
+  |
+9 |     let segment = book.read_segment(SegmentIndex::new(0)).unwrap();
+  |                        ^^^^^^^^^^^^ private method
+  |
+ ::: $WORKSPACE/crates/otp-book/src/lib.rs
+  |
+  |     pub(crate) fn read_segment(&self, index: SegmentIndex) -> Result<Segment, BookError> {
+  |     ------------------------------------------------------------------------------------ private method defined here
