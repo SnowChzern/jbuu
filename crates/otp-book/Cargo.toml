@@ -15,3 +15,9 @@ zeroize.workspace = true
 getrandom.workspace = true
 # 仅两处：文件头完整性元数据 + inspect 工具全段去重（工程哈希，不进密钥派生）
 sha2.workspace = true
+otp-anchor-spec.workspace = true
+otp-platform.workspace = true
+
+[dev-dependencies]
+trybuild = "1.0"
+otp-types.workspace = true

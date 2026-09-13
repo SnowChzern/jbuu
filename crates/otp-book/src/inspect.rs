@@ -303,7 +303,7 @@ mod tests {
         let seg0 = *book
             .read_segment(otp_types::SegmentIndex::new(0))
             .unwrap()
-            .expose_for_allocator();
+            .as_bytes();
         drop(book);
         overwrite_segment(&p, 17, &seg0);
 

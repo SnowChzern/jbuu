@@ -17,11 +17,9 @@
 //!
 //! [`Book::read_segment`] 为 **crate-private**；生产路径只有 otp-allocator
 //! 能在双锚 reservation intent fsync 成功之后调用（WP-02 §1.1 顺序强制：
-//! `intent_durable` 先于 `body_read`；调用契约见该方法文档）。跨 crate 的
-//! 封印机制（`#[doc(hidden)]` 受控入口 / 独立 internal shim / 宏导出）由
-//! WP-06（本 crate）与 WP-07（allocator）联合定稿；在此之前仅提供
-//! [`Book::__allocator_read_segment`] 过渡入口，且本目录已列入 CODEOWNERS
-//! 双批准清单，任何收紧/放松都需栋梁 + 安全审计复核。
+//! `intent_durable` 先于 `body_read`；调用契约见该方法文档）。
+//! 段读取实现与 allocator transaction 位于本 crate 内部；对外仅导出
+//! allocator 的已提交段签发接口，调用者无法取得预留中的段正文。
 //!
 //! ## 不预读承诺
 //!
@@ -32,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod allocator;
 pub mod generate;
 pub mod header;
 pub mod inspect;
@@ -61,10 +60,7 @@ pub struct Book {
 pub struct Segment([u8; SEGMENT_LEN]);
 
 impl Segment {
-    /// 过渡入口：仅供 otp-allocator 在双 reservation fsync 后读取
-    /// （见本 crate 文档“段读取的模块边界”）。
-    #[doc(hidden)]
-    pub fn expose_for_allocator(&self) -> &[u8; SEGMENT_LEN] {
+    pub(crate) fn as_bytes(&self) -> &[u8; SEGMENT_LEN] {
         &self.0
     }
 }
@@ -172,14 +168,6 @@ impl Book {
         let mut buf = [0u8; SEGMENT_LEN];
         pread_exact(&self.fd, &mut buf, offset)?;
         Ok(Segment(buf))
-    }
-
-    /// 过渡受控入口（见 crate 文档“段读取的模块边界”）；WP-06/07 定稿
-    /// 封印机制后移除或收紧。调用契约与 [`Book::read_segment`] 相同：
-    /// 仅限 otp-allocator 在双 reservation fsync 后调用。
-    #[doc(hidden)]
-    pub fn __allocator_read_segment(&self, index: SegmentIndex) -> Result<Segment, BookError> {
-        self.read_segment(index)
     }
 }
 
@@ -368,7 +356,7 @@ mod tests {
         for i in 0..4u64 {
             let seg = book.read_segment(SegmentIndex::new(i)).unwrap();
             assert_eq!(
-                seg.expose_for_allocator(),
+                seg.0,
                 &expected_xorshift_segment(i),
                 "segment {i}"
             );
@@ -385,7 +373,7 @@ mod tests {
         let before = *book
             .read_segment(SegmentIndex::new(0))
             .unwrap()
-            .expose_for_allocator();
+            .0;
         // 盘上把段 0 改成全 0xAA
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
@@ -396,7 +384,7 @@ mod tests {
         let after = *book
             .read_segment(SegmentIndex::new(0))
             .unwrap()
-            .expose_for_allocator();
+            .0;
         assert_eq!(before, expected_xorshift_segment(0));
         assert_eq!(
             after, [0xAA; SEGMENT_LEN],

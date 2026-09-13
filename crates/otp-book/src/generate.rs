@@ -207,7 +207,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for i in 0..256u64 {
             let seg = book.read_segment(otp_types::SegmentIndex::new(i)).unwrap();
-            let bytes = *seg.expose_for_allocator();
+            let bytes = *seg.as_bytes();
             assert_ne!(bytes, [0u8; 64], "段 {i} 不得为全零");
             assert!(seen.insert(bytes), "段 {i} 与此前段重复");
         }

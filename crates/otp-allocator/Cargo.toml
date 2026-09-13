@@ -1,6 +1,6 @@
 [package]
 name = "otp-allocator"
-description = "OTP 终端协议：段分配器（高危：reservation intent -> 双锚 fsync -> 读段 -> 最终锚）"
+description = "OTP 终端协议：段分配器 facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,4 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-otp-types.workspace = true
-otp-anchor-spec.workspace = true
 otp-book.workspace = true
-otp-platform.workspace = true
-sha2.workspace = true
-zeroize.workspace = true
