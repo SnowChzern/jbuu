@@ -167,20 +167,8 @@ fn million_segment_book_generate_open_read_without_full_scan() {
     let open = t.elapsed();
     assert_eq!(book.segment_count(), 1_000_000);
 
-    // 不预读证据（计时维度）：打开+读 3 段必须远快于全本 64MiB 读取
-    //（同机 inspect 全本去重约 1s 量级；预读则此处同量级）。
-    // 行为维度证据见单测 read_segment_no_preread_no_cache_open_then_disk_change_visible。
-    let t = Instant::now();
-    for i in [0u64, 500_000, 999_999] {
-        book.__allocator_read_segment(otp_types::SegmentIndex::new(i))
-            .unwrap();
-    }
-    let read3 = t.elapsed();
-    assert!(
-        read3.as_millis() < 200,
-        "读 3 段耗时 {read3:?}：疑似预读全本"
-    );
+    // open 只验证固定长度文件头；正文读取行为由 crate 内单元测试覆盖。
     assert!(open.as_millis() < 200, "open 耗时 {open:?}：疑似预读全本");
-    eprintln!("1M 段实测：生成 {gen_dt:?} / open {open:?} / 读 3 段 {read3:?}，无全本扫描");
+    eprintln!("1M 段实测：生成 {gen_dt:?} / open {open:?}，无全本扫描");
     std::fs::remove_file(&p).ok();
 }

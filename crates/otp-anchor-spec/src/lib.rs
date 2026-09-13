@@ -1,158 +1,330 @@
-//! # otp-anchor-spec —— 锚记录格式与恢复决策表
-//!
-//! 实现规划 §2 职责：斗拱输出的锚记录格式、CRC/MAC/完整性接口、generation
-//! 比较、状态转移与恢复决策表。线格式、校验算法与 5 类崩溃窗口的决策表由
-//! WP-02 冻结；本骨架（WP-04）固定接口形状。
-//!
-//! 禁止事项（规划 §2）：不实现实际落盘事务（真实后端在 otp-platform，
-//! 事务顺序在 otp-allocator，恢复编排在此之上的 otp-recovery）。
+//! Canonical OTP anchor records and deterministic two-copy recovery decisions.
 
 #![forbid(unsafe_code)]
 
 use core::cmp::Ordering;
 use otp_types::{BookId, Generation, SegmentIndex};
+use sha2::{Digest, Sha256};
 
-/// `previous_segment_hash`：SHA-256。仅作状态回滚检测的工程完整性锚，
-/// 不参与段到密钥的任何转换（设计书 §6：安全性依赖抗碰撞/抗篡改存储，
-/// 不得据此宣称签发层依赖哈希或获得信息论认证）。
+pub const ANCHOR_RECORD_LEN: usize = 104;
+const PREFIX_LEN: usize = 72;
+const MAGIC: &[u8; 4] = b"OTPA";
+const VERSION: u16 = 2;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SegmentHash(pub [u8; 32]);
 
-/// 锚记录（两处独立介质各存一份；字段见设计书 §7）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct AnchorRecord {
-    /// 密码本 ID。
-    pub book_id: BookId,
-    /// 下一个可用段（已预留/提交的段不再可用）。
-    pub next: SegmentIndex,
-    /// 单调 generation（两副本取高比较）。
-    pub generation: Generation,
-    /// 上一已签发段的 SHA-256（回滚检测锚）。
-    pub previous_segment_hash: SegmentHash,
+pub enum AnchorPayload {
+    Init,
+    Intent { reserved: SegmentIndex },
+    Commit { previous_segment_hash: SegmentHash },
 }
 
-impl AnchorRecord {
-    /// 按（generation, next）比较状态新旧，供“采用较高状态”判定。
-    pub fn state_cmp(&self, other: &Self) -> Ordering {
-        (self.generation, self.next).cmp(&(other.generation, other.next))
+impl AnchorPayload {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Init => 0,
+            Self::Intent { .. } => 1,
+            Self::Commit { .. } => 2,
+        }
     }
 }
 
-/// 锚副本标识（两处独立介质；不得只是同一文件的两个副本，设计书 §7）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AnchorRecord {
+    pub book_id: BookId,
+    pub next: SegmentIndex,
+    pub generation: Generation,
+    pub payload: AnchorPayload,
+}
+
+impl AnchorRecord {
+    pub const fn init(book_id: BookId) -> Self {
+        Self {
+            book_id,
+            next: SegmentIndex::ZERO,
+            generation: Generation::new(0),
+            payload: AnchorPayload::Init,
+        }
+    }
+
+    pub fn intent(book_id: BookId, generation: Generation, reserved: SegmentIndex) -> Self {
+        Self {
+            book_id,
+            next: reserved.next(),
+            generation,
+            payload: AnchorPayload::Intent { reserved },
+        }
+    }
+
+    pub fn commit(
+        book_id: BookId,
+        generation: Generation,
+        next: SegmentIndex,
+        previous_segment_hash: SegmentHash,
+    ) -> Self {
+        Self {
+            book_id,
+            next,
+            generation,
+            payload: AnchorPayload::Commit {
+                previous_segment_hash,
+            },
+        }
+    }
+
+    /// Frozen order: generation first, then INIT < INTENT < COMMIT.
+    pub fn state_cmp(&self, other: &Self) -> Ordering {
+        (self.generation, self.payload.tag()).cmp(&(other.generation, other.payload.tag()))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnchorCopy {
-    /// 副本 A。
     A,
-    /// 副本 B。
     B,
 }
 
-/// 锚后端抽象（规划 §2.2）：只暴露这三个操作；测试后端（otp-testkit）
-/// 可逐步注入短写、I/O 错误和 crash。
 pub trait AnchorStore {
-    /// 后端错误类型。
     type Error;
-    /// 读取并做完整性校验（CRC/MAC 算法由 WP-02 冻结）；校验失败返回 Err。
     fn read_verified(&mut self) -> Result<AnchorRecord, Self::Error>;
-    /// 全量覆盖写入并 fsync（短写必须循环补齐或显式报错，不得静默截断）。
     fn write_full_and_sync(&mut self, record: &AnchorRecord) -> Result<(), Self::Error>;
-    /// 当次会话创建过文件时，对其父目录 fsync。
     fn sync_parent_if_created(&mut self) -> Result<(), Self::Error>;
 }
 
-/// 锚记录读取失败分类。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadFailure {
-    /// 记录存在但完整性校验失败（→ 隔离）。
     Corrupt,
-    /// 介质不可读/不存在。
     Unreadable,
 }
 
-/// 锚格式/校验错误。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnchorSpecError {
-    /// 记录线格式解码失败。
-    DecodeFailed {
-        /// 原因。
-        reason: &'static str,
-    },
-    /// CRC/MAC 完整性校验失败。
+    DecodeFailed { reason: &'static str },
     IntegrityCheckFailed,
 }
 
-/// 恢复决策（覆盖设计书 §6 崩溃分析 5 类窗口 + §7 回滚检测）。
-/// 决策表逐条冻结于 WP-02；本枚举固定可能的结果空间。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecoveryDecision {
-    /// 两副本状态一致：直接采用。
     Consistent(AnchorRecord),
-    /// 一新一旧：采用较高 generation/next，候选段作废（浪费），
-    /// 修复并回写旧副本后各自 fsync（设计书 §6 窗口 2）。
     AdoptHigher {
-        /// 采用的记录。
         adopted: AnchorRecord,
-        /// 落后的副本（将被修复）。
         stale: AnchorCopy,
     },
-    /// 某副本校验失败：隔离该副本等待人工恢复，不得自动降级继续服务
-    /// （设计书 §7）。
     QuarantineCorrupt {
-        /// 被隔离副本。
         copy: AnchorCopy,
-        /// 原因说明。
         reason: &'static str,
     },
-    /// 双副本状态无法证明安全（如同时回滚且无外部单调源）：拒绝启动
-    /// （fail-closed；能力边界告警见 otp-recovery::RecoveryWarning）。
     CannotProveSafe {
-        /// 原因说明。
         reason: &'static str,
     },
-    /// 双副本均不可读取。
     BothUnreadable,
 }
 
-/// 编码一条锚记录（线格式 + CRC/MAC 由 WP-02 冻结）。
-pub fn encode_record(_record: &AnchorRecord, _out: &mut Vec<u8>) {
-    todo!("WP-02")
+pub fn encode_record(record: &AnchorRecord, out: &mut Vec<u8>) {
+    let mut bytes = [0u8; ANCHOR_RECORD_LEN];
+    bytes[0..4].copy_from_slice(MAGIC);
+    bytes[4..6].copy_from_slice(&VERSION.to_be_bytes());
+    bytes[6] = record.payload.tag();
+    bytes[8..24].copy_from_slice(record.book_id.as_bytes());
+    bytes[24..32].copy_from_slice(&record.generation.get().to_be_bytes());
+    bytes[32..40].copy_from_slice(&record.next.get().to_be_bytes());
+    match record.payload {
+        AnchorPayload::Init => {}
+        AnchorPayload::Intent { reserved } => {
+            bytes[40..48].copy_from_slice(&reserved.get().to_be_bytes());
+        }
+        AnchorPayload::Commit {
+            previous_segment_hash,
+        } => bytes[40..72].copy_from_slice(&previous_segment_hash.0),
+    }
+    let digest = Sha256::digest(&bytes[..PREFIX_LEN]);
+    bytes[PREFIX_LEN..].copy_from_slice(&digest);
+    out.extend_from_slice(&bytes);
 }
 
-/// 解码并校验一条锚记录。
-pub fn decode_and_verify(_buf: &[u8]) -> Result<AnchorRecord, AnchorSpecError> {
-    todo!("WP-02")
+pub fn decode_and_verify(buf: &[u8]) -> Result<AnchorRecord, AnchorSpecError> {
+    if buf.len() != ANCHOR_RECORD_LEN {
+        return decode_err("length");
+    }
+    if &buf[0..4] != MAGIC {
+        return decode_err("magic");
+    }
+    if u16::from_be_bytes([buf[4], buf[5]]) != VERSION {
+        return decode_err("version");
+    }
+    if buf[7] != 0 {
+        return decode_err("flags");
+    }
+    if Sha256::digest(&buf[..PREFIX_LEN]).as_slice() != &buf[PREFIX_LEN..] {
+        return Err(AnchorSpecError::IntegrityCheckFailed);
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&buf[8..24]);
+    let generation = Generation::new(be_u64(&buf[24..32]));
+    let next = SegmentIndex::new(be_u64(&buf[32..40]));
+    let payload = match buf[6] {
+        0 => {
+            if generation.get() != 0 || next.get() != 0 || buf[40..72].iter().any(|b| *b != 0) {
+                return decode_err("non-canonical-init");
+            }
+            AnchorPayload::Init
+        }
+        1 => {
+            if next.get() == 0 || buf[48..72].iter().any(|b| *b != 0) {
+                return decode_err("non-canonical-intent");
+            }
+            let reserved = SegmentIndex::new(be_u64(&buf[40..48]));
+            if reserved.get().checked_add(1) != Some(next.get()) {
+                return decode_err("intent-index");
+            }
+            AnchorPayload::Intent { reserved }
+        }
+        2 => {
+            if next.get() == 0 {
+                return decode_err("non-canonical-commit");
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&buf[40..72]);
+            AnchorPayload::Commit {
+                previous_segment_hash: SegmentHash(hash),
+            }
+        }
+        _ => return decode_err("record-type"),
+    };
+    Ok(AnchorRecord {
+        book_id: BookId::from_bytes(id),
+        next,
+        generation,
+        payload,
+    })
 }
 
-/// 恢复决策表入口：输入两副本的读取结果，输出唯一决策。
-/// 实现由 WP-02 冻结的决策表；恢复编排（读→决策→修复→回写→fsync）在
-/// otp-recovery。
 pub fn decide(
-    _a: Result<AnchorRecord, ReadFailure>,
-    _b: Result<AnchorRecord, ReadFailure>,
+    a: Result<AnchorRecord, ReadFailure>,
+    b: Result<AnchorRecord, ReadFailure>,
 ) -> RecoveryDecision {
-    todo!("WP-02")
+    match (a, b) {
+        (Err(ReadFailure::Unreadable), Err(ReadFailure::Unreadable)) => {
+            RecoveryDecision::BothUnreadable
+        }
+        (Err(_), Ok(_)) => RecoveryDecision::QuarantineCorrupt {
+            copy: AnchorCopy::A,
+            reason: "anchor-a-invalid",
+        },
+        (Ok(_), Err(_)) => RecoveryDecision::QuarantineCorrupt {
+            copy: AnchorCopy::B,
+            reason: "anchor-b-invalid",
+        },
+        (Err(_), Err(_)) => RecoveryDecision::CannotProveSafe {
+            reason: "both-anchors-invalid",
+        },
+        (Ok(a), Ok(b)) => {
+            if a.book_id != b.book_id {
+                return RecoveryDecision::CannotProveSafe {
+                    reason: "book-id-mismatch",
+                };
+            }
+            match a.state_cmp(&b) {
+                Ordering::Equal if a == b => RecoveryDecision::Consistent(a),
+                Ordering::Equal => RecoveryDecision::CannotProveSafe {
+                    reason: "same-order-different-bytes",
+                },
+                Ordering::Greater if a.next >= b.next => RecoveryDecision::AdoptHigher {
+                    adopted: a,
+                    stale: AnchorCopy::B,
+                },
+                Ordering::Less if b.next >= a.next => RecoveryDecision::AdoptHigher {
+                    adopted: b,
+                    stale: AnchorCopy::A,
+                },
+                _ => RecoveryDecision::CannotProveSafe {
+                    reason: "order-contradiction",
+                },
+            }
+        }
+    }
+}
+
+fn be_u64(bytes: &[u8]) -> u64 {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(bytes);
+    u64::from_be_bytes(value)
+}
+
+fn decode_err<T>(reason: &'static str) -> Result<T, AnchorSpecError> {
+    Err(AnchorSpecError::DecodeFailed { reason })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample(g: u64, next: u64) -> AnchorRecord {
-        AnchorRecord {
-            book_id: BookId::from_bytes([1; 16]),
-            next: SegmentIndex::new(next),
-            generation: Generation::new(g),
-            previous_segment_hash: SegmentHash([2; 32]),
+    const ID: BookId = BookId::from_bytes(*b"OTPTERM-TESTBOOK");
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace()
+            .flat_map(|part| {
+                (0..part.len())
+                    .step_by(2)
+                    .map(move |i| u8::from_str_radix(&part[i..i + 2], 16).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frozen_golden_records_match() {
+        let segment_hash = SegmentHash(
+            hex("fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108")
+                .try_into()
+                .unwrap(),
+        );
+        let cases = [
+            (
+                AnchorRecord::init(ID),
+                "e7b9b5274ccaa9515f731468cf39a77f4dd7854b1e90cabd214c86a49cfb7cbd",
+            ),
+            (
+                AnchorRecord::intent(ID, Generation::new(7), SegmentIndex::new(40)),
+                "0ed866f85a72ef89e3e93f396e2477e22275c0b4503dbd6842ef21d254a13d1c",
+            ),
+            (
+                AnchorRecord::commit(ID, Generation::new(7), SegmentIndex::new(41), segment_hash),
+                "feaa64c277074e34c9b807810268b3ea013141c3a336826050e7e21489e6f62e",
+            ),
+        ];
+        for (record, integrity) in cases {
+            let mut encoded = Vec::new();
+            encode_record(&record, &mut encoded);
+            assert_eq!(&encoded[72..], hex(integrity));
+            assert_eq!(decode_and_verify(&encoded).unwrap(), record);
         }
     }
 
     #[test]
-    fn state_cmp_prefers_higher_generation_then_next() {
-        let old = sample(3, 10);
-        let newer = sample(4, 11);
-        let same_gen_higher_next = sample(3, 11);
-        assert_eq!(old.state_cmp(&newer), Ordering::Less);
-        assert_eq!(old.state_cmp(&same_gen_higher_next), Ordering::Less);
-        assert_eq!(old.state_cmp(&old), Ordering::Equal);
+    fn commit_orders_after_intent_in_same_generation() {
+        let intent = AnchorRecord::intent(ID, Generation::new(7), SegmentIndex::new(40));
+        let commit = AnchorRecord::commit(
+            ID,
+            Generation::new(7),
+            SegmentIndex::new(41),
+            SegmentHash([9; 32]),
+        );
+        assert_eq!(intent.state_cmp(&commit), Ordering::Less);
+    }
+
+    #[test]
+    fn rejects_noncanonical_and_corrupt_records() {
+        let mut encoded = Vec::new();
+        encode_record(&AnchorRecord::init(ID), &mut encoded);
+        encoded[7] = 1;
+        assert!(decode_and_verify(&encoded).is_err());
+        encoded[7] = 0;
+        encoded[103] ^= 1;
+        assert_eq!(
+            decode_and_verify(&encoded),
+            Err(AnchorSpecError::IntegrityCheckFailed)
+        );
     }
 }
