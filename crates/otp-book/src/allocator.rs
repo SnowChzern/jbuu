@@ -8,11 +8,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use otp_anchor_spec::{
-    AnchorCopy, AnchorPayload, AnchorRecord, RecoveryDecision, SegmentHash, decide,
-    decode_and_verify, encode_record,
-};
 use super::{Book, BookError};
+use otp_anchor_spec::{
+    decode_and_verify, decide, encode_record, AnchorCopy, AnchorPayload, AnchorRecord,
+    RecoveryDecision, SegmentHash,
+};
 use otp_platform::{FileLockGuard, PlatformError, acquire_ofd_lock, fsync_file};
 use otp_types::{BookId, Generation, SEGMENT_LEN, SegmentIndex};
 use sha2::{Digest, Sha256};
@@ -593,7 +593,7 @@ mod tests {
             file.sync_all().unwrap();
         }
         let file = File::create(dir.join("segments.bin")).unwrap();
-        let header = super::header::BookHeader::new(ID, 3).unwrap().encode();
+        let header = crate::header::BookHeader::new(ID, 3).unwrap().encode();
         (&file).write_all(&header).unwrap();
         for value in 0..3u8 {
             (&file).write_all(&[value; SEGMENT_LEN]).unwrap();
@@ -697,7 +697,11 @@ mod tests {
             let dir = root.join(format!("{point:?}"));
             write_initial_files(&dir);
             let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::kill_boundary_child", "--nocapture"])
+                .args([
+                    "--exact",
+                    "allocator::tests::kill_boundary_child",
+                    "--nocapture",
+                ])
                 .env("OTP_ALLOCATOR_KILL_DIR", &dir)
                 .env("OTP_ALLOCATOR_KILL_POINT", format!("{point:?}"))
                 .spawn()

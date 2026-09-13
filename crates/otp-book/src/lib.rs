@@ -60,6 +60,7 @@ pub struct Book {
 pub struct Segment([u8; SEGMENT_LEN]);
 
 impl Segment {
+    #[cfg(test)]
     pub(crate) fn as_bytes(&self) -> &[u8; SEGMENT_LEN] {
         &self.0
     }
@@ -355,11 +356,7 @@ mod tests {
         let book = Book::open(&p).unwrap();
         for i in 0..4u64 {
             let seg = book.read_segment(SegmentIndex::new(i)).unwrap();
-            assert_eq!(
-                seg.0,
-                &expected_xorshift_segment(i),
-                "segment {i}"
-            );
+            assert_eq!(seg.0, expected_xorshift_segment(i), "segment {i}");
         }
         std::fs::remove_file(&p).ok();
     }
@@ -370,7 +367,7 @@ mod tests {
         let p = temp_path("nopre");
         write_test_book(&p, ID, 2).unwrap();
         let book = Book::open(&p).unwrap();
-        let before = *book
+        let before = book
             .read_segment(SegmentIndex::new(0))
             .unwrap()
             .0;
@@ -381,7 +378,7 @@ mod tests {
         f.write_all(&[0xAA; SEGMENT_LEN]).unwrap();
         f.sync_all().unwrap();
         drop(f);
-        let after = *book
+        let after = book
             .read_segment(SegmentIndex::new(0))
             .unwrap()
             .0;
