@@ -415,10 +415,16 @@ name = "otp-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "otp-allocator",
+ "otp-anchor-spec",
  "otp-book",
+ "otp-codec",
+ "otp-handshake",
  "otp-platform",
  "otp-recovery",
+ "otp-session",
  "otp-terminal",
+ "otp-transport",
  "otp-types",
 ]
 

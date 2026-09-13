@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "otp_term_cli"
+
 [[bin]]
 name = "otp-term"
 path = "src/main.rs"
@@ -17,4 +20,10 @@ otp-terminal.workspace = true
 otp-recovery.workspace = true
 otp-book.workspace = true
 otp-platform.workspace = true
+otp-codec.workspace = true
+otp-anchor-spec.workspace = true
+otp-allocator.workspace = true
+otp-handshake.workspace = true
+otp-session.workspace = true
+otp-transport.workspace = true
 clap.workspace = true
