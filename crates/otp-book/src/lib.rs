@@ -367,10 +367,7 @@ mod tests {
         let p = temp_path("nopre");
         write_test_book(&p, ID, 2).unwrap();
         let book = Book::open(&p).unwrap();
-        let before = book
-            .read_segment(SegmentIndex::new(0))
-            .unwrap()
-            .0;
+        let before = book.read_segment(SegmentIndex::new(0)).unwrap().0;
         // 盘上把段 0 改成全 0xAA
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
@@ -378,10 +375,7 @@ mod tests {
         f.write_all(&[0xAA; SEGMENT_LEN]).unwrap();
         f.sync_all().unwrap();
         drop(f);
-        let after = book
-            .read_segment(SegmentIndex::new(0))
-            .unwrap()
-            .0;
+        let after = book.read_segment(SegmentIndex::new(0)).unwrap().0;
         assert_eq!(before, expected_xorshift_segment(0));
         assert_eq!(
             after, [0xAA; SEGMENT_LEN],

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use super::{Book, BookError};
 use otp_anchor_spec::{
-    decode_and_verify, decide, encode_record, AnchorCopy, AnchorPayload, AnchorRecord,
-    RecoveryDecision, SegmentHash,
+    AnchorCopy, AnchorPayload, AnchorRecord, RecoveryDecision, SegmentHash, decide,
+    decode_and_verify, encode_record,
 };
 use otp_platform::{FileLockGuard, PlatformError, acquire_ofd_lock, fsync_file};
 use otp_types::{BookId, Generation, SEGMENT_LEN, SegmentIndex};
@@ -370,10 +370,7 @@ impl SegmentReader for BookReader {
     }
 
     fn read(&mut self, index: SegmentIndex) -> Result<[u8; SEGMENT_LEN], MediaError> {
-        let segment = self
-            .book
-            .read_segment(index)
-            .map_err(|_| MediaError::Io)?;
+        let segment = self.book.read_segment(index).map_err(|_| MediaError::Io)?;
         Ok(segment.0)
     }
 }
