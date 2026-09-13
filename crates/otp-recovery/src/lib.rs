@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use otp_anchor_spec::{decide, AnchorCopy, AnchorPayload, AnchorRecord, AnchorStore};
+use otp_anchor_spec::{AnchorCopy, AnchorPayload, AnchorRecord, AnchorStore, decide};
 use otp_types::Generation;
 
 /// 恢复结果报告（仅公开元数据；可进入审计日志白名单字段）。
@@ -110,9 +110,7 @@ where
     );
     let (adopted, stale) = match decision {
         otp_anchor_spec::RecoveryDecision::Consistent(record) => (record, None),
-        otp_anchor_spec::RecoveryDecision::AdoptHigher { adopted, stale } => {
-            (adopted, Some(stale))
-        }
+        otp_anchor_spec::RecoveryDecision::AdoptHigher { adopted, stale } => (adopted, Some(stale)),
         otp_anchor_spec::RecoveryDecision::QuarantineCorrupt { copy, reason } => {
             return Err(RecoveryError::Quarantined {
                 copy: Some(copy),
@@ -126,10 +124,7 @@ where
             });
         }
         otp_anchor_spec::RecoveryDecision::CannotProveSafe { reason } => {
-            return Err(RecoveryError::Quarantined {
-                copy: None,
-                reason,
-            });
+            return Err(RecoveryError::Quarantined { copy: None, reason });
         }
     };
 
@@ -150,15 +145,19 @@ where
         // No lower record is ever written, so recovery cannot move next back.
         match stale_copy {
             AnchorCopy::A => {
-                a.write_full_and_sync(&adopted).map_err(|_| RecoveryError::Store)?;
-                a.sync_parent_if_created().map_err(|_| RecoveryError::Store)?;
+                a.write_full_and_sync(&adopted)
+                    .map_err(|_| RecoveryError::Store)?;
+                a.sync_parent_if_created()
+                    .map_err(|_| RecoveryError::Store)?;
                 if a.read_verified().map_err(|_| RecoveryError::Store)? != adopted {
                     return Err(RecoveryError::Store);
                 }
             }
             AnchorCopy::B => {
-                b.write_full_and_sync(&adopted).map_err(|_| RecoveryError::Store)?;
-                b.sync_parent_if_created().map_err(|_| RecoveryError::Store)?;
+                b.write_full_and_sync(&adopted)
+                    .map_err(|_| RecoveryError::Store)?;
+                b.sync_parent_if_created()
+                    .map_err(|_| RecoveryError::Store)?;
                 if b.read_verified().map_err(|_| RecoveryError::Store)? != adopted {
                     return Err(RecoveryError::Store);
                 }
@@ -193,10 +192,16 @@ mod tests {
 
     impl Store {
         fn valid(record: AnchorRecord) -> Self {
-            Self { record: Ok(record), writes: Cell::new(0) }
+            Self {
+                record: Ok(record),
+                writes: Cell::new(0),
+            }
         }
         fn invalid() -> Self {
-            Self { record: Err(()), writes: Cell::new(0) }
+            Self {
+                record: Err(()),
+                writes: Cell::new(0),
+            }
         }
     }
 
@@ -211,7 +216,9 @@ mod tests {
             self.writes.set(self.writes.get() + 1);
             Ok(())
         }
-        fn sync_parent_if_created(&mut self) -> Result<(), Self::Error> { Ok(()) }
+        fn sync_parent_if_created(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     fn record(generation: u64, next: u64) -> AnchorRecord {
@@ -229,10 +236,16 @@ mod tests {
             adopted: record(1, 1),
             repaired: Some(AnchorCopy::B),
             quarantined: vec![],
-            warnings: vec![RecoveryWarning::StaleCopyRepaired { copy: AnchorCopy::B }],
+            warnings: vec![RecoveryWarning::StaleCopyRepaired {
+                copy: AnchorCopy::B,
+            }],
         };
-        assert!(matches!(r.warnings.as_slice(),
-            [RecoveryWarning::StaleCopyRepaired { copy: AnchorCopy::B }]));
+        assert!(matches!(
+            r.warnings.as_slice(),
+            [RecoveryWarning::StaleCopyRepaired {
+                copy: AnchorCopy::B
+            }]
+        ));
     }
 
     #[test]
@@ -245,7 +258,13 @@ mod tests {
         assert_eq!(report.repaired, Some(AnchorCopy::B));
         assert_eq!(b.record, Ok(newer));
         assert_eq!(b.writes.get(), 1);
-        assert!(report.warnings.contains(&RecoveryWarning::StaleCopyRepaired { copy: AnchorCopy::B }));
+        assert!(
+            report
+                .warnings
+                .contains(&RecoveryWarning::StaleCopyRepaired {
+                    copy: AnchorCopy::B
+                })
+        );
     }
 
     #[test]
@@ -265,7 +284,13 @@ mod tests {
         let mut a = Store::valid(record(3, 4));
         let mut b = Store::valid(record(3, 5));
         let err = recover(&mut a, &mut b).unwrap_err();
-        assert_eq!(err, RecoveryError::Quarantined { copy: None, reason: "same-order-different-bytes" });
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: None,
+                reason: "same-order-different-bytes"
+            }
+        );
         assert_eq!(a.writes.get(), 0);
         assert_eq!(b.writes.get(), 0);
     }
@@ -275,7 +300,13 @@ mod tests {
         let mut a = Store::invalid();
         let mut b = Store::valid(record(1, 2));
         let err = recover(&mut a, &mut b).unwrap_err();
-        assert_eq!(err, RecoveryError::Quarantined { copy: Some(AnchorCopy::A), reason: "anchor-a-invalid" });
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: Some(AnchorCopy::A),
+                reason: "anchor-a-invalid"
+            }
+        );
         assert_eq!(a.writes.get(), 0);
         assert_eq!(b.writes.get(), 0);
     }
@@ -285,7 +316,11 @@ mod tests {
         let mut a = Store::valid(record(4, 6));
         let mut b = Store::valid(record(4, 6));
         let report = recover(&mut a, &mut b).unwrap();
-        assert!(report.warnings.contains(&RecoveryWarning::DualRollbackUndetectable));
+        assert!(
+            report
+                .warnings
+                .contains(&RecoveryWarning::DualRollbackUndetectable)
+        );
         assert_eq!(report.adopted.next.get(), 6);
     }
 
@@ -293,8 +328,8 @@ mod tests {
     fn watermark_blocks_start_without_advancing_or_repairing() {
         let mut a = Store::valid(record(4, 6));
         let mut b = Store::valid(record(4, 6));
-        let err = recover_with_options(&mut a, &mut b, Some(Generation::new(5)), |_| true)
-            .unwrap_err();
+        let err =
+            recover_with_options(&mut a, &mut b, Some(Generation::new(5)), |_| true).unwrap_err();
         assert_eq!(err, RecoveryError::RollbackBlocked);
         assert_eq!(a.writes.get(), 0);
         assert_eq!(b.writes.get(), 0);
@@ -305,7 +340,13 @@ mod tests {
         let mut a = Store::valid(record(2, 3));
         let mut b = Store::valid(record(2, 3));
         let err = recover_with_options(&mut a, &mut b, None, |_| false).unwrap_err();
-        assert_eq!(err, RecoveryError::Quarantined { copy: None, reason: "book-anchor-mismatch" });
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: None,
+                reason: "book-anchor-mismatch"
+            }
+        );
         assert_eq!(a.writes.get(), 0);
         assert_eq!(b.writes.get(), 0);
     }
