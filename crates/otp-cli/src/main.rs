@@ -25,19 +25,23 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use otp_book::generate::{generate_book, random_book_id};
 
+use std::sync::Arc;
+
 use otp_term_cli::auditlog::Audit;
 use otp_term_cli::doctor as cli_doctor;
 use otp_term_cli::proto::{self, Endpoint, SessionFailure, SessionInfo};
 use otp_term_cli::recoveryio;
-use otp_transport::FramedStream as _;
+use otp_terminal::TerminalHandle;
 use otp_types::{BookId, Generation, SegmentIndex};
 
 /// 骨架子命令（drain/rotate）的退出码（区别于 1=运行失败、2=策略拒绝）。
 const EXIT_WP17_SKELETON: i32 = 3;
 /// 策略拒绝启动（doctor BLOCK / 恢复失败 / 分配器拒绝）。
 const EXIT_POLICY_REFUSED: i32 = 2;
-/// 默认会话超时（握手 + 数据面整体）。
+/// 默认会话超时（握手 + 附着整体；数据面由 lease/心跳治理）。
 const DEFAULT_DEADLINE_SECS: u64 = 120;
+/// 默认 PTY 单主 lease 超时（毫秒）。
+const DEFAULT_LEASE_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,8 +56,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// 启动服务端：体检→恢复→加载密码本+双锚，接受连接并签发段（数据面：
-    /// 加密回显，PTY 归 WP-16）。
+    /// 启动服务端：体检→恢复→加载密码本+双锚，接受连接并签发段；数据面
+    /// = PTY 交互式远程终端（WP-16：单主 lease + 恢复句柄 + 窗口/退出码）。
     Serve {
         /// 密码本路径。
         #[arg(long)]
@@ -73,14 +77,21 @@ enum Cmd {
         /// 服务多少个连接后退出（默认一直服务；受控测试/轮换演练用）。
         #[arg(long, default_value_t = u64::MAX)]
         sessions: u64,
-        /// 会话超时（秒）。
+        /// 会话超时（秒；仅约束握手阶段，数据面由 lease/心跳治理）。
         #[arg(long, default_value_t = DEFAULT_DEADLINE_SECS)]
         deadline_secs: u64,
+        /// PTY shell 可执行文件（缺省 $SHELL，再退 /bin/sh）。
+        #[arg(long)]
+        shell: Option<String>,
+        /// PTY 单主 lease 超时（毫秒；客户端按 1/3 周期心跳）。
+        #[arg(long, default_value_t = DEFAULT_LEASE_TIMEOUT_MS)]
+        lease_timeout_ms: u64,
         /// 显式接受未证明加密的 swap（把 BLOCK 降级为 warn；仅限受控环境）。
         #[arg(long)]
         allow_unencrypted_swap: bool,
     },
-    /// 以客户端身份连接服务端并建立加密会话（stdin→加密→回显解密→stdout）。
+    /// 以客户端身份连接服务端：交互式远程终端（原始模式 stdin ⇄ 加密 PTY；
+    /// 退出码=远端 shell 退出码）。
     Connect {
         /// 密码本路径（与服务端同本同 book_id）。
         #[arg(long)]
@@ -94,10 +105,14 @@ enum Cmd {
         /// 服务端地址（host:port）。
         #[arg(long)]
         target: String,
+        /// 恢复句柄（wp02 §5.3：恢复=重新握手新签发段+附着旧终端；
+        /// 句柄见 connect 的 TERMINAL 行，--recover 0 表示不恢复）。
+        #[arg(long)]
+        recover: Option<u64>,
         /// 审计日志路径（JSONL 白名单字段；缺省不落盘）。
         #[arg(long)]
         audit_log: Option<PathBuf>,
-        /// 会话超时（秒）。
+        /// 会话超时（秒；仅约束握手与附着阶段）。
         #[arg(long, default_value_t = DEFAULT_DEADLINE_SECS)]
         deadline_secs: u64,
         /// 显式接受未证明加密的 swap（把 BLOCK 降级为 warn；仅限受控环境）。
@@ -231,6 +246,8 @@ fn run(cmd: Cmd) -> Result<(), CliError> {
             audit_log,
             sessions,
             deadline_secs,
+            shell,
+            lease_timeout_ms,
             allow_unencrypted_swap,
         } => run_serve(ServeArgs {
             book,
@@ -240,6 +257,8 @@ fn run(cmd: Cmd) -> Result<(), CliError> {
             audit_log,
             sessions,
             deadline: Duration::from_secs(deadline_secs.max(1)),
+            shell: shell.unwrap_or_else(default_shell),
+            lease_timeout: Duration::from_millis(lease_timeout_ms.max(1)),
             allow_unencrypted_swap,
         }),
         Cmd::Connect {
@@ -248,6 +267,7 @@ fn run(cmd: Cmd) -> Result<(), CliError> {
             anchor_b,
             target,
             audit_log,
+            recover,
             deadline_secs,
             allow_unencrypted_swap,
         } => run_connect(ConnectArgs {
@@ -256,6 +276,7 @@ fn run(cmd: Cmd) -> Result<(), CliError> {
             anchor_b,
             target,
             audit_log,
+            recover: recover.map(TerminalHandle),
             deadline: Duration::from_secs(deadline_secs.max(1)),
             allow_unencrypted_swap,
         }),
@@ -347,7 +368,14 @@ struct ServeArgs {
     audit_log: Option<PathBuf>,
     sessions: u64,
     deadline: Duration,
+    shell: String,
+    lease_timeout: Duration,
     allow_unencrypted_swap: bool,
+}
+
+/// 缺省 shell：$SHELL → /bin/sh。
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 fn run_serve(args: ServeArgs) -> Result<(), CliError> {
@@ -417,7 +445,7 @@ fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     }
 
     // ⑥ 分配器（内部再次做严格双锚对账 + 密码本哈希校验；OFD 锁独占）。
-    let mut alloc = otp_allocator::Allocator::open(otp_allocator::AllocatorConfig {
+    let alloc = otp_allocator::Allocator::open(otp_allocator::AllocatorConfig {
         book: args.book.clone(),
         anchor_a: args.anchor_a.clone(),
         anchor_b: args.anchor_b.clone(),
@@ -436,17 +464,31 @@ fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         gen0.get()
     ));
 
-    // ⑦ 监听 + 会话循环（每连接：握手→回显；fail-closed per connection）。
+    // ⑦ PTY 终端服务（WP-16）：共享分配器（握手串行）+ 共享终端注册表
+    //    （单主 lease/fencing 跨连接强制）+ 每连接一线程（并发恢复竞争）。
+    let shell_argv = vec![args.shell.clone()];
+    let registry = Arc::new(otp_terminal::TerminalRegistry::new(
+        shell_argv.clone(),
+        args.lease_timeout,
+    ));
+    let alloc = Arc::new(std::sync::Mutex::new(alloc));
+    let audit = Arc::new(std::sync::Mutex::new(audit));
     let listener = otp_transport::TcpListener::bind(&args.listen)
         .map_err(|_| CliError::Exit(1, format!("监听失败：{}", args.listen)))?;
     let addr = listener
         .local_addr()
         .map_err(|_| CliError::Exit(1, "无法获取监听地址".into()))?;
+    // 行格式冻结：LISTEN= 行只含地址（下游测试按行解析）；终端参数单列。
+    status(&format!(
+        "TERMINAL-SERVE shell={shell_argv:?} lease_timeout_ms={}",
+        args.lease_timeout.as_millis()
+    ));
     status(&format!("LISTEN={addr}"));
 
     let mut served: u64 = 0;
+    let mut workers = Vec::new();
     while served < args.sessions {
-        let mut io = match listener.accept() {
+        let io = match listener.accept() {
             Ok(io) => io,
             Err(e) => {
                 status(&format!("accept 失败：{e:?}（继续/退出由循环边界决定）"));
@@ -454,28 +496,18 @@ fn run_serve(args: ServeArgs) -> Result<(), CliError> {
             }
         };
         served += 1;
-        match serve_one(&mut io, &mut alloc, ep, args.deadline, &mut audit, book_id) {
-            Ok((info, bytes)) => {
-                status(&format!(
-                    "SESSION segment={} generation={} echoed_bytes={}",
-                    info.segment.get(),
-                    info.generation.get(),
-                    bytes
-                ));
-            }
-            Err(f) => {
-                let (next, generation) = alloc.state();
-                let _ = audit.emit_err(book_id, next, generation, Outcome::Rejected, f.category);
-                status(&format!(
-                    "SESSION-FAILED {} (next={})",
-                    f.line(),
-                    next.get()
-                ));
-            }
-        }
-        let _ = io.close();
+        let registry = Arc::clone(&registry);
+        let alloc = Arc::clone(&alloc);
+        let audit = Arc::clone(&audit);
+        let deadline = args.deadline;
+        workers.push(std::thread::spawn(move || {
+            serve_one(io, &registry, &alloc, &audit, ep, deadline, book_id)
+        }));
     }
-    let (next, generation) = alloc.state();
+    for w in workers {
+        let _ = w.join();
+    }
+    let (next, generation) = alloc.lock().unwrap().state();
     status(&format!(
         "EXIT next={} generation={} sessions={}",
         next.get(),
@@ -485,31 +517,88 @@ fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// 单连接服务线程：WP-15 握手（重新仲裁+签发新段）→ WP-16 终端附着
+/// （Open/Attach → 单主 lease → PTY 数据面 → 退出码回传）。
 fn serve_one(
-    io: &mut dyn otp_transport::FramedStream,
-    alloc: &mut otp_allocator::Allocator,
+    mut io: otp_transport::TcpTransport,
+    registry: &Arc<otp_terminal::TerminalRegistry>,
+    alloc: &Arc<std::sync::Mutex<otp_allocator::Allocator>>,
+    audit: &Arc<std::sync::Mutex<Audit>>,
     ep: Endpoint,
     deadline: Duration,
-    audit: &mut Audit,
     book_id: BookId,
-) -> Result<(SessionInfo, u64), SessionFailure> {
-    let (mut session, info) = proto::server_handshake(io, alloc, ep, deadline)?;
-    // 审计先于数据面：签发事实落盘（失败即 fail closed 整个 serve 会话）。
-    audit
+) {
+    // ① WP-15 握手（每连接重新仲裁 + 签发新段；恢复连接同样如此——
+    //    wp02 §5.3：断线恢复绝不重用旧段）。
+    let handshake = {
+        let mut alloc = alloc.lock().unwrap();
+        proto::server_handshake(&mut io, &mut alloc, ep, deadline)
+    };
+    let (session, info) = match handshake {
+        Ok(pair) => pair,
+        Err(f) => {
+            let (next, generation) = alloc.lock().unwrap().state();
+            let _ = audit.lock().unwrap().emit_err(
+                book_id,
+                next,
+                generation,
+                otp_platform::Outcome::Rejected,
+                f.category,
+            );
+            status(&format!(
+                "SESSION-FAILED {} (next={})",
+                f.line(),
+                next.get()
+            ));
+            return;
+        }
+    };
+    // ② 审计先于数据面：签发事实落盘（失败即 fail closed 整个会话）。
+    if audit
+        .lock()
+        .unwrap()
         .emit_ok(
             book_id,
             info.segment,
             info.generation,
             otp_platform::Outcome::Issued,
         )
-        .map_err(|_| {
-            SessionFailure::new(
-                otp_codec::ErrorCode::IO_ERROR,
-                otp_types::ErrorCategory::Platform,
-            )
-        })?;
-    let bytes = proto::server_echo_loop(io, &mut session)?;
-    Ok((info, bytes))
+        .is_err()
+    {
+        status("SESSION-FAILED audit-sink（fail closed）");
+        return;
+    }
+    // ③ WP-16 终端数据面（Open/Attach → 单主 lease → PTY ⇄ 加密 DATA →
+    //    退出码回传；终止时 serve_connection 负责关闭传输）。
+    let summary = otp_terminal::serve_connection(
+        registry,
+        io,
+        session,
+        registry.next_conn(),
+        &otp_terminal::ServeOptions::default(),
+    );
+    status(&format!(
+        "SESSION segment={} generation={} handle={} token={} in_bytes={} out_bytes={} exit={} end={}",
+        info.segment.get(),
+        info.generation.get(),
+        summary.handle.0,
+        summary.token.0,
+        summary.input_bytes,
+        summary.output_bytes,
+        summary.exit.map_or(-1, |e| e.code),
+        summary.end
+    ));
+    // ④ 单主拒绝的审计（rejected/terminal；其余终态均为租约生命周期事件）。
+    if summary.end == otp_terminal::ServeEnd::DeniedBusy {
+        let (next, generation) = alloc.lock().unwrap().state();
+        let _ = audit.lock().unwrap().emit_err(
+            book_id,
+            next,
+            generation,
+            otp_platform::Outcome::Rejected,
+            otp_types::ErrorCategory::Terminal,
+        );
+    }
 }
 
 // ───────────────────────── connect ─────────────────────────
@@ -520,6 +609,7 @@ struct ConnectArgs {
     anchor_b: PathBuf,
     target: String,
     audit_log: Option<PathBuf>,
+    recover: Option<TerminalHandle>,
     deadline: Duration,
     allow_unencrypted_swap: bool,
 }
@@ -589,45 +679,121 @@ fn run_connect(args: ConnectArgs) -> Result<(), CliError> {
         )
     })?;
 
-    // ⑤ TCP 连接 + 握手 + stdio 数据面。
+    // ⑤ TCP 连接 + 握手（新签发段）+ WP-16 交互式终端数据面。
     let mut io = otp_transport::TcpTransport::connect(&args.target)
         .map_err(|_| CliError::Exit(1, format!("连接失败：{}", args.target)))?;
-    let result = (|| -> Result<(SessionInfo, u64), SessionFailure> {
-        let (mut session, info) = proto::client_handshake(&mut io, &mut alloc, ep, args.deadline)?;
+    let result = (|| -> Result<(SessionInfo, otp_terminal::ExitStatus), SessionFailure> {
+        let (session, info) = proto::client_handshake(&mut io, &mut alloc, ep, args.deadline)?;
         audit
-            .emit_ok(book_id, info.segment, info.generation, Outcome::Issued)
+            .emit_ok(
+                book_id,
+                info.segment,
+                info.generation,
+                otp_platform::Outcome::Issued,
+            )
             .map_err(|_| {
                 SessionFailure::new(
                     otp_codec::ErrorCode::IO_ERROR,
                     otp_types::ErrorCategory::Platform,
                 )
             })?;
-        let stdin = std::io::stdin();
-        let mut lock = stdin.lock();
+        // 原始模式 + 初始窗口（非 tty 输入按 24x80 降级，测试管道可用）。
+        let _raw = otp_platform::pty::RawMode::enter_stdin();
+        let window = otp_platform::pty::tty_winsize_stdin()
+            .map(|w| otp_terminal::WindowSize {
+                rows: w.rows,
+                cols: w.cols,
+            })
+            .unwrap_or(otp_terminal::WindowSize::FALLBACK);
+        let mode = match args.recover {
+            Some(handle) => otp_terminal::AttachMode::Recover { handle, window },
+            None => otp_terminal::AttachMode::New { window },
+        };
+        let client = otp_terminal::TerminalSession::attach(
+            io,
+            session,
+            mode,
+            &otp_terminal::ClientOptions {
+                attach_timeout: args.deadline,
+            },
+        )
+        .map_err(map_terminal_err)?;
+        status(&format!(
+            "TERMINAL handle={} token={} segment={}",
+            client.handle().0,
+            client.token(),
+            info.segment.get()
+        ));
+        let ping = otp_terminal::TerminalConfig {
+            lease_timeout: Duration::from_secs(DEFAULT_LEASE_TIMEOUT_MS / 1000),
+        }
+        .ping_interval();
+        // Stdin 句柄本身 Send+'static（内部逐次加锁）；读取线程随
+        // run_interactive 移交所有权（远端退出后不阻塞等待 stdin EOF）。
+        let input = std::io::stdin();
         let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let bytes = proto::client_stdio_pump(&mut io, &mut session, &mut lock, &mut out)?;
-        Ok((info, bytes))
+        let mut output = stdout.lock();
+        let code = client
+            .run_interactive(input, &mut output, ping, || {
+                otp_platform::pty::tty_winsize_stdin().map(|w| otp_terminal::WindowSize {
+                    rows: w.rows,
+                    cols: w.cols,
+                })
+            })
+            .map_err(map_terminal_err)?;
+        Ok((info, code))
     })();
     match result {
-        Ok((info, bytes)) => {
-            let _ = io.close();
+        Ok((info, code)) => {
             status(&format!(
-                "DONE segment={} generation={} sent_bytes={} next={}",
+                "DONE segment={} generation={} exit={} next={}",
                 info.segment.get(),
                 info.generation.get(),
-                bytes,
+                code.code,
                 alloc.state().0.get()
             ));
-            Ok(())
+            // 退出码 = 远端 shell 退出码（信号终止=128+sig）。
+            Err(CliError::Exit(
+                code.code,
+                format!("远程终端退出码 {}", code.code),
+            ))
         }
         Err(f) => {
             let (next, generation) = alloc.state();
-            let _ = audit.emit_err(book_id, next, generation, Outcome::Rejected, f.category);
-            let _ = io.close();
+            let _ = audit.emit_err(
+                book_id,
+                next,
+                generation,
+                otp_platform::Outcome::Rejected,
+                f.category,
+            );
+            // 传输所有权已随会话移交（attach/run_interactive 的错误路径
+            // 均已关闭会话与传输）。
             Err(CliError::Exit(1, format!("会话失败：{}", f.line())))
         }
     }
+}
+
+/// 终端层错误 → 会话失败（类别=terminal/handshake/session/transport）。
+fn map_terminal_err(e: otp_terminal::TerminalError) -> SessionFailure {
+    let category = match &e {
+        otp_terminal::TerminalError::Handshake(_) => otp_types::ErrorCategory::Handshake,
+        otp_terminal::TerminalError::Session(_) => otp_types::ErrorCategory::Session,
+        otp_terminal::TerminalError::Transport(_) => otp_types::ErrorCategory::Transport,
+        _ => otp_types::ErrorCategory::Terminal,
+    };
+    let code = match &e {
+        otp_terminal::TerminalError::LeaseHeldByOther { .. } => otp_codec::ErrorCode::BAD_ORDER,
+        otp_terminal::TerminalError::StaleWriter => otp_codec::ErrorCode::SEQ_REPLAY,
+        otp_terminal::TerminalError::TerminalGone => otp_codec::ErrorCode::BAD_ORDER,
+        otp_terminal::TerminalError::Handshake(h) => h.code(),
+        otp_terminal::TerminalError::Session(s) => s
+            .wire_code()
+            .map_or(otp_codec::ErrorCode::INTERNAL, otp_codec::ErrorCode),
+        otp_terminal::TerminalError::Transport(t) => t.code(),
+        _ => otp_codec::ErrorCode::IO_ERROR,
+    };
+    SessionFailure::new(code, category)
 }
 
 // ───────────────────────── book / anchor ─────────────────────────

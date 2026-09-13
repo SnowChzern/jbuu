@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod doctor;
+pub mod pty;
 
 pub use audit::{JsonlAuditSink, audit_entry_to_json, category_str, outcome_str};
 pub use doctor::{

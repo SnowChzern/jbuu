@@ -496,7 +496,9 @@ dependencies = [
 name = "otp-terminal"
 version = "0.1.0"
 dependencies = [
+ "otp-codec",
  "otp-handshake",
+ "otp-platform",
  "otp-session",
  "otp-transport",
  "otp-types",

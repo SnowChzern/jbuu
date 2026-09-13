@@ -9,6 +9,10 @@ publish.workspace = true
 
 [dependencies]
 otp-types.workspace = true
+otp-codec.workspace = true
 otp-handshake.workspace = true
 otp-session.workspace = true
 otp-transport.workspace = true
+# PTY/termios syscall 集中在平台层（任务 #54 硬边界：libc 调用遵循
+# otp-platform 既有 deny+逐点 allow 模式）；本 crate 保持 forbid(unsafe)。
+otp-platform.workspace = true

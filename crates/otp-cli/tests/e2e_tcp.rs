@@ -1,13 +1,16 @@
-//! WP-15 验收 ②④（TCP 半 + doctor/审计面）：**真实 `otp-term` 二进制**双
-//! 进程经 localhost TCP（中继录制全部流经字节）完成端到端加密会话。
+//! WP-15 验收 ②④ + WP-16 终端数据面（TCP 半 + doctor/审计面）：**真实
+//! `otp-term` 二进制**双进程经 localhost TCP（中继录制全部流经字节）完成
+//! 端到端加密**交互式 PTY 终端**会话。
 //!
-//! 复用 WP-12 M1 回显口径与断言：
-//! - 客户端 stdout 的回显明文与输入逐字节一致（数据面；stdout 只承载
-//!   明文，其余输出面一律不含明文）；
-//! - 中继录制的 TCP 字节流不含明文标记/段正文；
-//! - 会话后服务端 next=1（EXIT 行）；
-//! - 审计日志（serve+connect 双侧）为白名单 JSONL，secret 扫描通过；
-//! - serve/connect 的 stderr、serve 的 stdout 均不含明文标记/段正文。
+//! 断言（PTY 终端口径，任务 #54）：
+//! - 客户端 stdout 含远端 shell 对输入脚本标记的输出（数据面；stdout 只
+//!   承载明文，其余输出面一律不含明文）；客户端退出码 = 远端退出码；
+//! - 中继录制的 TCP 字节流不含明文标记/段正文（PTY 流全走 record 加密）；
+//! - 会话后服务端 next=1（EXIT 行）；SESSION 行含 handle/token/exit；
+//! - **恢复 e2e**（wp02 §5.3）：断线（detach）→ `connect --recover <句柄>`
+//!   重新握手（消耗下一新段，旧段零重用）→ 附着同一 PTY（shell 状态
+//!   存活）→ 退出码回传；
+//! - 审计日志（serve+connect 双侧）为白名单 JSONL，secret 扫描通过。
 //!
 //! doctor 面（验收 ④）：正例（0600+排除标记+swap 覆盖 → exit 0）与反例
 //! （0644 权限 → exit 2 拒绝启动；本机未证明加密 swap 且无覆盖 → exit 2）。
@@ -31,7 +34,6 @@ use otp_types::{BookId, SEGMENT_LEN};
 const ID: BookId = BookId::from_bytes(*b"OTPTERM-TESTBOOK");
 const OTHER_ID: BookId = BookId::from_bytes(*b"OTPTERM-OTHRBOOK");
 const COUNT: u64 = 8;
-const CHUNK_LEN: usize = 65536;
 const CHUNKS: usize = 4; // 256 KiB（二进制 e2e 用量；loopback 侧另有 1 MiB）
 const DEADLINE: Duration = Duration::from_secs(180);
 
@@ -100,34 +102,12 @@ fn write_no_backup_marker(dir: &Path) {
     std::fs::write(dir.join(".otp-term-nobackup"), b"ops marker\n").unwrap();
 }
 
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 fn marker(i: usize) -> [u8; 16] {
     let mut m = *b"OTPTERM-ECHO-i__";
     m[13] = b'0' + u8::try_from((i / 10) % 10).unwrap();
     m[14] = b'0' + u8::try_from(i % 10).unwrap();
     m[15] = b'|';
     m
-}
-
-fn echo_input() -> Vec<u8> {
-    let mut all = Vec::with_capacity(CHUNKS * CHUNK_LEN);
-    for i in 0..CHUNKS {
-        let mut chunk = Vec::with_capacity(CHUNK_LEN);
-        chunk.extend_from_slice(&marker(i));
-        let mut state = (i as u64).wrapping_mul(0x0100_0000_0000_0001) | 1;
-        while chunk.len() < CHUNK_LEN {
-            chunk.extend_from_slice(&splitmix64(&mut state).to_le_bytes());
-        }
-        all.extend_from_slice(&chunk);
-    }
-    all
 }
 
 // ───────────────────────── 中继（录制观察点，WP-12 口径） ─────────────────────────
@@ -346,10 +326,27 @@ fn assert_no_secret_in(label: &str, bytes: &[u8]) {
     }
 }
 
-// ───────────────────────── ① TCP 端到端（主用例） ─────────────────────────
+// ───────────────────────── ① TCP 端到端（主用例，PTY 终端） ─────────────────────────
+
+/// 终端输入脚本：多行标记命令 + 显式退出（每行 < canonical 上限）。
+fn terminal_script() -> Vec<u8> {
+    let mut all = Vec::new();
+    for i in 0..CHUNKS {
+        let pad = "t".repeat(64);
+        all.extend_from_slice(
+            format!("echo {marker}-{i:02} {pad}\n", marker = marker_str()).as_bytes(),
+        );
+    }
+    all.extend_from_slice(b"exit 7\n");
+    all
+}
+
+fn marker_str() -> &'static str {
+    "OTPTERM-ECHO-i__"
+}
 
 #[test]
-fn tcp_two_process_cli_end_to_end_encrypted_echo() {
+fn tcp_two_process_cli_end_to_end_encrypted_terminal() {
     let server_dir = scratch("s");
     let client_dir = scratch("c");
     let s_book = write_test_book(&server_dir, ID, 0x11);
@@ -373,6 +370,8 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
         "127.0.0.1:0",
         "--sessions",
         "1",
+        "--shell",
+        "/bin/sh",
         "--audit-log",
         s_audit.to_str().unwrap(),
         "--allow-unencrypted-swap",
@@ -382,7 +381,7 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
     let addr = server.wait_stderr_tag("LISTEN=");
     let (relay_addr, recording, relay_done) = spawn_relay(addr);
 
-    let input = echo_input();
+    let input = terminal_script();
     let (ccode, cout, cerr) = run_to_completion(
         &[
             "connect",
@@ -404,8 +403,8 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
     );
     assert_eq!(
         ccode,
-        0,
-        "connect 应成功退出；stderr:\n{}",
+        7,
+        "connect 退出码=远端 shell 退出码；stderr:\n{}",
         String::from_utf8_lossy(&cerr)
     );
 
@@ -413,7 +412,6 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
         std::thread::sleep(Duration::from_millis(5));
     }
     relay_done.join().unwrap().expect("中继两端建立");
-
     let (scode, sout, serr) = server.finish();
     assert_eq!(
         scode,
@@ -422,10 +420,18 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
         String::from_utf8_lossy(&serr)
     );
 
-    // ① 回显逐字节一致（客户端 stdout = 输入明文；stdout 是唯一明文面）。
-    assert_eq!(cout, input, "客户端 stdout 回显明文应与输入一致");
+    // ① 数据面：客户端 stdout 含全部标记的 shell 输出（stdout 是唯一明文面）。
+    let cout_text = String::from_utf8_lossy(&cout).to_string();
+    for i in 0..CHUNKS {
+        let m = format!("{}-{:02}", marker_str(), i);
+        assert!(
+            cout_text.contains(&m),
+            "stdout 缺少标记 {m}（PTY 输出未回传）"
+        );
+    }
 
-    // ② 指针只前进：serve EXIT next=1；connect DONE 行含 next=1。
+    // ② 指针只前进：serve EXIT next=1；connect DONE 行含 next=1 与 exit=7；
+    //    SESSION 行含 WP-16 元数据（handle/token/退出码/终止原因）。
     let serr_text = String::from_utf8_lossy(&serr).to_string();
     let cerr_text = String::from_utf8_lossy(&cerr).to_string();
     assert!(
@@ -433,11 +439,20 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
         "serve stderr:\n{serr_text}"
     );
     assert!(cerr_text.contains("next=1"), "connect stderr:\n{cerr_text}");
-    assert!(serr_text.contains("SESSION segment=0 generation=1"));
+    assert!(cerr_text.contains("exit=7"), "connect stderr:\n{cerr_text}");
+    assert!(
+        cerr_text.contains("TERMINAL handle=1 token=1"),
+        "connect stderr:\n{cerr_text}"
+    );
+    assert!(serr_text.contains("SESSION segment=0 generation=1 handle=1 token=1"));
+    assert!(
+        serr_text.contains("exit=7 end=shell-exited(7)"),
+        "serve stderr:\n{serr_text}"
+    );
 
     // ③ secret 扫描：TCP 字节流 / serve stdout+stderr / connect stderr。
     let stream = recording.lock().unwrap().clone();
-    assert!(stream.len() > input.len(), "TCP 字节流应大于明文总量");
+    assert!(stream.len() > 1024, "TCP 字节流应有可观流量");
     assert_no_secret_in("tcp-relay-stream", &stream);
     let zeros = stream
         .chunks(64)
@@ -470,6 +485,129 @@ fn tcp_two_process_cli_end_to_end_encrypted_echo() {
     }
     let s_audit_text = std::fs::read_to_string(&s_audit).unwrap();
     assert!(s_audit_text.contains("\"outcome\":\"recovered\""));
+
+    let _ = std::fs::remove_dir_all(&server_dir);
+    let _ = std::fs::remove_dir_all(&client_dir);
+}
+
+// ───────────────────────── ①′ TCP 恢复 e2e（wp02 §5.3 全栈） ─────────────────────────
+
+#[test]
+fn tcp_recovery_consumes_new_segment_and_attaches_same_pty() {
+    let server_dir = scratch("rs");
+    let client_dir = scratch("rc");
+    let s_book = write_test_book(&server_dir, ID, 0x11);
+    let (s_a, s_b) = write_init_anchors(&server_dir, ID);
+    let c_book = write_test_book(&client_dir, ID, 0x11);
+    let (c_a, c_b) = write_init_anchors(&client_dir, ID);
+    write_no_backup_marker(&server_dir);
+    write_no_backup_marker(&client_dir);
+
+    // 3 个会话位：conn1 建立+detach，conn2 恢复+退出，第 3 位兜底。
+    let server = LongProc::spawn(&[
+        "serve",
+        "--book",
+        s_book.to_str().unwrap(),
+        "--anchor-a",
+        s_a.to_str().unwrap(),
+        "--anchor-b",
+        s_b.to_str().unwrap(),
+        "--listen",
+        "127.0.0.1:0",
+        "--sessions",
+        "2",
+        "--shell",
+        "/bin/sh",
+        "--allow-unencrypted-swap",
+    ]);
+    let addr = server.wait_stderr_tag("LISTEN=");
+
+    // conn1：建立终端并留下状态；脚本以 EOF 收尾 → detach（退出码 0）。
+    let (code1, out1, err1) = run_to_completion(
+        &[
+            "connect",
+            "--book",
+            c_book.to_str().unwrap(),
+            "--anchor-a",
+            c_a.to_str().unwrap(),
+            "--anchor-b",
+            c_b.to_str().unwrap(),
+            "--target",
+            &addr,
+            "--allow-unencrypted-swap",
+        ],
+        Some(b"CLI_REC_STATE=4242; echo SET-OK\n"),
+    );
+    assert_eq!(
+        code1,
+        0,
+        "detach 语义退出码 0；stderr:\n{}",
+        String::from_utf8_lossy(&err1)
+    );
+    let err1_text = String::from_utf8_lossy(&err1).to_string();
+    assert!(
+        err1_text.contains("TERMINAL handle=1 token=1"),
+        "{err1_text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out1).contains("SET-OK"),
+        "stdout 应含 SET-OK"
+    );
+    // 等 serve 侧 SESSION 行落盘（conn1 结束）。
+    let session1 = server.wait_stderr_tag("SESSION ");
+    assert!(session1.contains("handle=1"), "{session1}");
+    assert!(session1.contains("end=peer-closed"), "{session1}");
+
+    // conn2：恢复句柄 1——重新握手（新段，旧段零重用）+ 附着同一 PTY。
+    let (code2, out2, err2) = run_to_completion(
+        &[
+            "connect",
+            "--book",
+            c_book.to_str().unwrap(),
+            "--anchor-a",
+            c_a.to_str().unwrap(),
+            "--anchor-b",
+            c_b.to_str().unwrap(),
+            "--target",
+            &addr,
+            "--recover",
+            "1",
+            "--allow-unencrypted-swap",
+        ],
+        Some(b"echo REC-MARK=$CLI_REC_STATE\nexit 9\n"),
+    );
+    assert_eq!(
+        code2,
+        9,
+        "恢复会话退出码=远端 9；stderr:\n{}",
+        String::from_utf8_lossy(&err2)
+    );
+    let out2_text = String::from_utf8_lossy(&out2).to_string();
+    assert!(
+        out2_text.contains("REC-MARK=4242"),
+        "恢复附着的是同一 PTY（shell 状态存活）：\n{out2_text}"
+    );
+    let err2_text = String::from_utf8_lossy(&err2).to_string();
+    assert!(
+        err2_text.contains("TERMINAL handle=1 token=2"),
+        "接管 token 递增：{err2_text}"
+    );
+    assert!(err2_text.contains("segment=1"), "恢复签发新段：{err2_text}");
+
+    let (scode, _sout, serr) = server.finish();
+    assert_eq!(scode, 0);
+    let serr_text = String::from_utf8_lossy(&serr).to_string();
+    // 两会话两段：next=2（段 0、段 1 各一次，零重用）；SESSION 行各含段号。
+    assert!(
+        serr_text.contains("EXIT next=2"),
+        "serve stderr:\n{serr_text}"
+    );
+    assert!(serr_text.contains("SESSION segment=0 generation=1 handle=1 token=1"));
+    assert!(serr_text.contains("SESSION segment=1 generation=2 handle=1 token=2"));
+    assert!(
+        serr_text.contains("exit=9 end=shell-exited(9)"),
+        "{serr_text}"
+    );
 
     let _ = std::fs::remove_dir_all(&server_dir);
     let _ = std::fs::remove_dir_all(&client_dir);
