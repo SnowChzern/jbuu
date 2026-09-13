@@ -5,6 +5,16 @@
 //! files) parent-directory sync.  All errors are fail-closed.
 #![deny(unsafe_code)]
 
+pub mod audit;
+pub mod doctor;
+
+pub use audit::{JsonlAuditSink, audit_entry_to_json, category_str, outcome_str};
+pub use doctor::{
+    DoctorCategory, DoctorFinding, DoctorPaths, DoctorReport, NO_BACKUP_MARKER,
+    collect_backup_facts, collect_core_facts, collect_perm_facts, collect_swap_facts, eval_backup,
+    eval_core, eval_perm, eval_swap, harden_process, parse_proc_swaps, run_doctor,
+};
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
