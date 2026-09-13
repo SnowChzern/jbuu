@@ -13,7 +13,8 @@
 
 #![forbid(unsafe_code)]
 
-use otp_anchor_spec::{AnchorCopy, AnchorRecord, AnchorStore};
+use otp_anchor_spec::{AnchorCopy, AnchorPayload, AnchorRecord, AnchorStore, decide};
+use otp_types::Generation;
 
 /// 恢复结果报告（仅公开元数据；可进入审计日志白名单字段）。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -59,30 +60,180 @@ pub enum RecoveryError {
     },
     /// 存储读写失败。
     Store,
+    /// 锚副本损坏或无法证明双锚状态安全，拒绝启动。
+    Quarantined {
+        /// 被隔离的副本（双锚异常时为 None）。
+        copy: Option<AnchorCopy>,
+        /// 机器可读的白名单原因。
+        reason: &'static str,
+    },
+    /// 外部单调水位高于双锚，阻断疑似快照回滚。
+    RollbackBlocked,
 }
 
 /// 启动恢复：读取/验证双锚 → 按 WP-02 决策表取高修复 → 回写并双 fsync。
 /// 任何不确定都返回 Err（调用方必须拒绝提供服务）。
 pub fn recover<A: AnchorStore, B: AnchorStore>(
-    _a: &mut A,
-    _b: &mut B,
+    a: &mut A,
+    b: &mut B,
 ) -> Result<RecoveryReport, RecoveryError> {
-    todo!("WP-08")
+    recover_with_options(a, b, None, |_| true)
+}
+
+/// Recover with the optional external generation watermark and book verifier.
+///
+/// The verifier is called only for COMMIT records. Returning false is a
+/// quarantine condition; it never causes the pointer to advance. The default
+/// [`recover`] entry point deliberately has no implicit book access because
+/// the anchor-store boundary does not own the book file.
+pub fn recover_with_options<A, B, F>(
+    a: &mut A,
+    b: &mut B,
+    watermark: Option<Generation>,
+    mut verify_commit: F,
+) -> Result<RecoveryReport, RecoveryError>
+where
+    A: AnchorStore,
+    B: AnchorStore,
+    F: FnMut(&AnchorRecord) -> bool,
+{
+    let ra = a.read_verified().map_err(|_| ());
+    let rb = b.read_verified().map_err(|_| ());
+
+    // The store abstraction intentionally exposes only verified records. Any
+    // read error is therefore treated as an invalid copy and never repaired.
+    // `decide` still handles the both-unreadable case for callers whose
+    // backend can distinguish it before crossing this deliberately small API.
+    let decision = decide(
+        ra.map_err(|_| otp_anchor_spec::ReadFailure::Corrupt),
+        rb.map_err(|_| otp_anchor_spec::ReadFailure::Corrupt),
+    );
+    let (adopted, stale) = match decision {
+        otp_anchor_spec::RecoveryDecision::Consistent(record) => (record, None),
+        otp_anchor_spec::RecoveryDecision::AdoptHigher { adopted, stale } => (adopted, Some(stale)),
+        otp_anchor_spec::RecoveryDecision::QuarantineCorrupt { copy, reason } => {
+            return Err(RecoveryError::Quarantined {
+                copy: Some(copy),
+                reason,
+            });
+        }
+        otp_anchor_spec::RecoveryDecision::BothUnreadable => {
+            return Err(RecoveryError::Quarantined {
+                copy: None,
+                reason: "both-anchors-unreadable",
+            });
+        }
+        otp_anchor_spec::RecoveryDecision::CannotProveSafe { reason } => {
+            return Err(RecoveryError::Quarantined { copy: None, reason });
+        }
+    };
+
+    if watermark.is_some_and(|floor| adopted.generation < floor) {
+        return Err(RecoveryError::RollbackBlocked);
+    }
+    if matches!(adopted.payload, AnchorPayload::Commit { .. }) && !verify_commit(&adopted) {
+        return Err(RecoveryError::Quarantined {
+            copy: None,
+            reason: "book-anchor-mismatch",
+        });
+    }
+
+    let mut warnings = vec![RecoveryWarning::DualRollbackUndetectable];
+    let repaired = if let Some(stale_copy) = stale {
+        // `write_full_and_sync` is the complete repair transaction: the
+        // backend must finish the full record and fsync before returning.
+        // No lower record is ever written, so recovery cannot move next back.
+        match stale_copy {
+            AnchorCopy::A => {
+                a.write_full_and_sync(&adopted)
+                    .map_err(|_| RecoveryError::Store)?;
+                a.sync_parent_if_created()
+                    .map_err(|_| RecoveryError::Store)?;
+                if a.read_verified().map_err(|_| RecoveryError::Store)? != adopted {
+                    return Err(RecoveryError::Store);
+                }
+            }
+            AnchorCopy::B => {
+                b.write_full_and_sync(&adopted)
+                    .map_err(|_| RecoveryError::Store)?;
+                b.sync_parent_if_created()
+                    .map_err(|_| RecoveryError::Store)?;
+                if b.read_verified().map_err(|_| RecoveryError::Store)? != adopted {
+                    return Err(RecoveryError::Store);
+                }
+            }
+        }
+        warnings.push(RecoveryWarning::StaleCopyRepaired { copy: stale_copy });
+        Some(stale_copy)
+    } else {
+        None
+    };
+
+    Ok(RecoveryReport {
+        adopted,
+        repaired,
+        quarantined: Vec::new(),
+        warnings,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    const ID: otp_types::BookId = otp_types::BookId::from_bytes(*b"OTPTERM-TESTBOOK");
+
+    #[derive(Clone)]
+    struct Store {
+        record: Result<AnchorRecord, ()>,
+        writes: Cell<usize>,
+    }
+
+    impl Store {
+        fn valid(record: AnchorRecord) -> Self {
+            Self {
+                record: Ok(record),
+                writes: Cell::new(0),
+            }
+        }
+        fn invalid() -> Self {
+            Self {
+                record: Err(()),
+                writes: Cell::new(0),
+            }
+        }
+    }
+
+    impl AnchorStore for Store {
+        type Error = ();
+
+        fn read_verified(&mut self) -> Result<AnchorRecord, Self::Error> {
+            self.record
+        }
+        fn write_full_and_sync(&mut self, record: &AnchorRecord) -> Result<(), Self::Error> {
+            self.record = Ok(*record);
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+        fn sync_parent_if_created(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn record(generation: u64, next: u64) -> AnchorRecord {
+        AnchorRecord::commit(
+            ID,
+            Generation::new(generation),
+            otp_types::SegmentIndex::new(next),
+            otp_anchor_spec::SegmentHash([generation as u8; 32]),
+        )
+    }
 
     #[test]
     fn report_only_carries_public_metadata() {
         let r = RecoveryReport {
-            adopted: AnchorRecord::commit(
-                otp_types::BookId::from_bytes([0; 16]),
-                otp_types::Generation::new(1),
-                otp_types::SegmentIndex::new(1),
-                otp_anchor_spec::SegmentHash([0; 32]),
-            ),
+            adopted: record(1, 1),
             repaired: Some(AnchorCopy::B),
             quarantined: vec![],
             warnings: vec![RecoveryWarning::StaleCopyRepaired {
@@ -95,5 +246,121 @@ mod tests {
                 copy: AnchorCopy::B
             }]
         ));
+    }
+
+    #[test]
+    fn adopts_and_repairs_when_a_is_new_b_is_old() {
+        let newer = record(2, 3);
+        let mut a = Store::valid(newer);
+        let mut b = Store::valid(record(1, 2));
+        let report = recover(&mut a, &mut b).unwrap();
+        assert_eq!(report.adopted, newer);
+        assert_eq!(report.repaired, Some(AnchorCopy::B));
+        assert_eq!(b.record, Ok(newer));
+        assert_eq!(b.writes.get(), 1);
+        assert!(
+            report
+                .warnings
+                .contains(&RecoveryWarning::StaleCopyRepaired {
+                    copy: AnchorCopy::B
+                })
+        );
+    }
+
+    #[test]
+    fn adopts_and_repairs_when_b_is_new_a_is_old() {
+        let newer = record(7, 9);
+        let mut a = Store::valid(record(6, 8));
+        let mut b = Store::valid(newer);
+        let report = recover(&mut a, &mut b).unwrap();
+        assert_eq!(report.adopted, newer);
+        assert_eq!(report.repaired, Some(AnchorCopy::A));
+        assert_eq!(a.record, Ok(newer));
+        assert_eq!(a.writes.get(), 1);
+    }
+
+    #[test]
+    fn inconsistent_anchors_are_quarantined_without_writes() {
+        let mut a = Store::valid(record(3, 4));
+        let mut b = Store::valid(record(3, 5));
+        let err = recover(&mut a, &mut b).unwrap_err();
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: None,
+                reason: "same-order-different-bytes"
+            }
+        );
+        assert_eq!(a.writes.get(), 0);
+        assert_eq!(b.writes.get(), 0);
+    }
+
+    #[test]
+    fn corrupt_copy_is_quarantined_and_frozen() {
+        let mut a = Store::invalid();
+        let mut b = Store::valid(record(1, 2));
+        let err = recover(&mut a, &mut b).unwrap_err();
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: Some(AnchorCopy::A),
+                reason: "anchor-a-invalid"
+            }
+        );
+        assert_eq!(a.writes.get(), 0);
+        assert_eq!(b.writes.get(), 0);
+    }
+
+    #[test]
+    fn software_only_mode_reports_undetectable_dual_rollback() {
+        let mut a = Store::valid(record(4, 6));
+        let mut b = Store::valid(record(4, 6));
+        let report = recover(&mut a, &mut b).unwrap();
+        assert!(
+            report
+                .warnings
+                .contains(&RecoveryWarning::DualRollbackUndetectable)
+        );
+        assert_eq!(report.adopted.next.get(), 6);
+    }
+
+    #[test]
+    fn watermark_blocks_start_without_advancing_or_repairing() {
+        let mut a = Store::valid(record(4, 6));
+        let mut b = Store::valid(record(4, 6));
+        let err =
+            recover_with_options(&mut a, &mut b, Some(Generation::new(5)), |_| true).unwrap_err();
+        assert_eq!(err, RecoveryError::RollbackBlocked);
+        assert_eq!(a.writes.get(), 0);
+        assert_eq!(b.writes.get(), 0);
+    }
+
+    #[test]
+    fn commit_verification_failure_is_fail_closed() {
+        let mut a = Store::valid(record(2, 3));
+        let mut b = Store::valid(record(2, 3));
+        let err = recover_with_options(&mut a, &mut b, None, |_| false).unwrap_err();
+        assert_eq!(
+            err,
+            RecoveryError::Quarantined {
+                copy: None,
+                reason: "book-anchor-mismatch"
+            }
+        );
+        assert_eq!(a.writes.get(), 0);
+        assert_eq!(b.writes.get(), 0);
+    }
+
+    #[test]
+    fn adopted_next_never_recedes_and_candidate_cannot_be_reused() {
+        let newer = record(9, 11);
+        let mut a = Store::valid(newer);
+        let mut b = Store::valid(record(8, 10));
+        let report = recover(&mut a, &mut b).unwrap();
+        // The next allocation starts at adopted.next, never at the candidate
+        // i = adopted.next - 1; recovery itself has no decrementing path.
+        assert!(report.adopted.next.get() >= 11);
+        assert_ne!(report.adopted.next.get(), 10);
+        assert_eq!(b.record, Ok(newer));
     }
 }

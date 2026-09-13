@@ -1,0 +1,5 @@
+verification=blocked
+reason=cargo and rustc unavailable in environment
+attempt=export PATH=$HOME/.cargo/bin:$PATH; cargo fmt --all && cargo test -p otp-recovery --locked
+result=cargo: command not found
+static=git diff --check PASS
