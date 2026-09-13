@@ -1,0 +1,9 @@
+# WP-08 recovery trace
+A-new/B-old: recover adopts higher record, repairs B, re-reads B, emits StaleCopyRepaired
+B-new/A-old: recover adopts higher record, repairs A, re-reads A, emits StaleCopyRepaired
+invalid anchor: returns ANC-equivalent Quarantined error without writes
+same-order mismatch: returns Quarantined without writes
+software-only: emits DualRollbackUndetectable; no automatic forward movement
+watermark: returns RollbackBlocked before repair; no writes or service continuation
+commit verifier failure: returns Quarantined before repair
+monotonic next: only adopted higher next is returned; candidate next-1 is not reusable
