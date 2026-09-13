@@ -501,7 +501,12 @@ dependencies = [
 name = "otp-transport"
 version = "0.1.0"
 dependencies = [
+ "otp-allocator",
+ "otp-anchor-spec",
+ "otp-book",
  "otp-codec",
+ "otp-handshake",
+ "otp-session",
  "otp-types",
 ]
 

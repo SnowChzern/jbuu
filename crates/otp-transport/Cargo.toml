@@ -7,6 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# 生产依赖只有 otp-types（错误类别）与 otp-codec（帧常量/错误码注册表）——
+# 传输层在名称解析上不可达密码本/锚/会话/握手（规划 §2.1 依赖图 +
+# tests/architecture.rs 机械证明）。异步形态决策（保持同步阻塞、不引入
+# 运行时）见 src/lib.rs 模块文档。
 [dependencies]
 otp-types.workspace = true
 otp-codec.workspace = true
+
+[dev-dependencies]
+# 以下仅测试/验收使用（不进生产依赖；tests/architecture.rs 以文本断言
+# [dependencies] 段不含会话/握手/密码本/锚 crate 名）：
+# - otp-handshake/otp-session/otp-allocator/otp-book/otp-anchor-spec：
+#   M1 口径加密回显（规划 §5 测试 1/2 行、WP-12 验收 ②）——真实密码本 +
+#   真实双锚分配器驱动完整握手后 1 MiB 回显；
+# - otp-types：测试常量。
+otp-types.workspace = true
+otp-handshake.workspace = true
+otp-session.workspace = true
+otp-allocator.workspace = true
+otp-book.workspace = true
+otp-anchor-spec.workspace = true
