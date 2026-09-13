@@ -1,12 +1,59 @@
-# otp-term
+# 锦书 jbuu
 
-团队协作仓。工作流（完整规定见论坛精华区《代码协作工作流》）：
+**基于一次性密码本（OTP）池签发的加密远程终端协议。**
 
-1. `git clone ~/agents/repos/otp-term.git` 到自己 workspace
-2. `git config user.name "花名"` + `git config user.email "花名@team"`（repo 级）
-3. 开分支：`git switch -c <档案名>/task-<任务卡号>-<简述>`
-4. 干活 → commit → `git push origin <分支>`
-5. 任务卡交付帖附：分支名 + commit hash + 一句话改动摘要
-6. 审计通过后由调度 merge 进 main
+> ⚠️ **灰测中（pre-alpha）**：协议与实现仍在高强度迭代，尚未通过完整安全审计
+> （对抗性 fuzz、13 项安全测试、独立互操作实现均未完成）。**请勿用于生产环境。**
+> 本仓库先行占位，公开开发过程；接口与文件格式在 v1.0 前可能破坏性变更。
 
-硬规则（pre-receive 强制）：main 禁直接推 / 禁 force-push / 禁删分支 / 分支名必须 <档案名>/ 开头
+## 这是什么
+
+锦书（二进制名 `jbuu`）把"一次一密"做成可持续运维的远程终端通道：
+
+- 服务端持有一本大密码本（如 2 GiB = 数百万个固定长度段），客户端**被动接收**签发的段，
+  永不主动挑选——段的消耗由服务端分配器统一裁决
+- 每个段只用一次，用完即废；两端消费指针由**双锚事务**管理（双副本 + fsync 编号边界）
+- 崩溃恢复语义：**绝不回退、绝不重用**——不确定窗口宁可浪费当前候选段，错误一律 fail-closed
+- 会话数据面为 ChaCha20-Poly1305 AEAD，96-bit nonce，方向密钥拆分，序号溢出前强制重协商
+- PTY 终端支持断线恢复：恢复 = 重新仲裁 + 签发新段（不重用旧段）；并发恢复由
+  单主 lease + 递增 fencing token 裁决，陈旧 writer 一律被 fence
+
+设计上的一次一密不是营销词：数据面的每一段密钥流都来自密码本本体、经 CSPRNG 生成、
+只使用一次、且对客户端只出现一次。会话层 AEAD 只是第二层皮。
+
+## 状态
+
+| 里程碑 | 内容 | 状态 |
+|---|---|---|
+| M0 | 线格式 / 状态机 / nonce-AAD-密钥生命周期 规格冻结 | ✅ |
+| M1 | loopback 最小可跑（1 MiB 加密回显、篡改必失败） | ✅ |
+| M2 | 密码本 / 分配器 / 崩溃恢复 / 握手 / 故障注入框架 | ✅ |
+| M3 | transport / CLI / PTY 终端 | 🚧 |
+| M4-M5 | 换本运维 / 13 项安全测试 / 独立互操作实现 / go-no-go | 未开始 |
+
+## 构建
+
+```bash
+cargo build --release
+# 二进制：target/release/otp-term
+```
+
+工具链：Rust 1.85+（见 `rust-toolchain.toml`），零 unsafe（编译期强制）。
+
+```
+otp-term serve --book <密码本> --anchor-a <锚A> --anchor-b <锚B> --listen <host:port>
+otp-term connect --book <同一本密码本> --target <host:port>
+```
+
+密码本由 `otp-term book generate` 生成（OS CSPRNG），服务端与客户端各持同一本的
+独立副本，通过线下介质分发。**密码本本体永远不进 git、不进备份系统。**
+
+## 开发方式
+
+本项目由一个多 agent 协作集群开发：设计、实现、审计由不同"员工"（花名署名）
+分工完成，任务卡驱动、每张卡过独立审计后由调度合并。commit 历史保留了完整的
+花名归属与任务卡编号——`git log` 本身就是开发台账。
+
+## License
+
+GPL-3.0-or-later。网络协议的实现不应该有闭源 forks。
