@@ -1,66 +1,54 @@
-# 任务 #43 阻断报告：Rust 可见性无法表达“仅 otp-allocator 可调用”
+# 任务 #43 阻断报告（复核版）
 
 ## 结论
 
-停手，不提交放宽规范的实现。依据 Rust 稳定版模块可见性规则，`otp-book` 与
-`otp-allocator` 是两个独立 crate；`pub(crate)` 只允许 `otp-book` 自身 crate，
-不能允许某一个指定的依赖 crate。Rust 没有“仅允许依赖方 X、拒绝其它依赖方”的
-crate 可见性修饰符。
+停手，不交付换名或换包装的公开裸读路径。当前 crate 拆分下，任务要求与 Rust 稳定版可见性规则不可同时满足：
 
-因此，规划 §4.1 的原文约束：
+1. `otp-book::Book::read_segment` 保持 `pub(crate)`；
+2. 独立 crate `otp-allocator` 可以调用它；
+3. 任意其它外部模拟 crate 调用段读取路径必须编译失败。
 
-> `otp-book::read_segment` 对外为 crate-private，仅 otp-allocator 可在双
-> reservation fsync 后调用
+Rust 没有“只允许指定依赖 crate”的可见性修饰符。`pub(crate)` 的范围是定义它的 crate；`pub`（无论是否 `#[doc(hidden)]`、是否改名、是否包装成协议入口）对所有依赖 crate 可见。因此继续改造只能在两种结果之间选择：allocator 编译失败，或负向测试失败。
 
-在保持 `read_segment` 为 `pub(crate)`、同时让现有独立 `otp-allocator` 调用它的
-前提下，无法编译级实现。
+## 基线与现状
 
-## 已核对的现状
+- 基线：`b62c8a8c7d9fb584351a3beccea090f21143a4dc`（`principal/task-40`）
+- 当前分支：`principal/task-43`
+- 当前交付 commit：`bce3063604afadb8a0a52bceb93951608201e25f`
+- 阻断符号仍在基线代码中：
+  - `crates/otp-book/src/lib.rs`：`read_segment` 为 `pub(crate)`，同时存在 `pub fn __allocator_read_segment`；
+  - `Segment` 同时存在 `pub fn expose_for_allocator`；
+  - `crates/otp-allocator/src/lib.rs` 通过两者读取段正文；
+  - `crates/otp-book/tests/api_surface.rs` 仅为源码字符串断言，不是编译级负向测试。
 
-基线为 `b62c8a8c7d9fb584351a3beccea090f21143a4dc`（任务 #40）：
+## 已排除的伪修复
 
-- `crates/otp-book/src/lib.rs` 的 `Book::read_segment` 已是 `pub(crate)`；
-- 为跨 crate 调用而存在的 `Book::__allocator_read_segment` 和
-  `Segment::expose_for_allocator` 是 `pub`，`#[doc(hidden)]` 不提供权限边界；
-- `crates/otp-allocator/src/lib.rs:374-379` 通过这两个公开符号读取正文；
-- `crates/otp-book/tests/api_surface.rs` 是源码字符串断言，不是编译级负向测试。
+- `pub(super)` / `pub(crate)`：allocator 立即无法编译，因为它是独立 crate；
+- capability token：若 allocator 能构造/获得公开 token，任意外部 crate 也能获得；
+- `#[doc(hidden)]`、命名约定、源码扫描：均不构成 Rust 权限边界；
+- 将双 fsync 顺序包装进 `pub fn`：能约束实现顺序，但不能阻止外部 crate 调用该公开函数。
 
-## 为什么常见修法都不能满足验收
+## 能真正收敛的方案（需调度/安全裁决）
 
-1. 将入口改为 `pub(super)` / `pub(crate)`：`otp-allocator` 立即无法编译，
-   因其是独立 crate，不是 `otp-book` 的模块。
-2. capability token（私有字段、sealed trait）：如果 token 的构造或实现只在
-   `otp-book` 内，则 allocator 也无法获得；若提供公开构造/公开工厂，则任意
-   workspace crate 同样可获得，不能证明“仅 allocator”。
-3. `#[doc(hidden)]`、命名约定、源码扫描、`cfg`：均不是 Rust 编译器权限边界。
-4. 将“fsync 后读段”包装成一个公开协议入口：可以保证调用该入口自身执行顺序，
-   但任意外部 crate 仍能调用该公开入口；除非同时改变架构，将 reservation、
-   anchor media 和 book reader 归并到同一 crate / 私有模块。
+### 方案 A（推荐）——合并高危边界
 
-## 可收敛的架构选项（需调度/芥末拍板）
+将段生产读取实现、双 reservation 事务与 allocator transaction 放入同一真实受控 crate/模块；对外只暴露 `SegmentIssuer::issue() -> CommittedSegment`。这样 `read_segment` 可保持 crate-private（或进一步私有），外部模拟 crate 对任何裸读路径均编译失败。代价是调整 crate 依赖图和规划 §2.1。
 
-### A（推荐）：合并高危边界
-将 `Book` 的生产读取实现、双 reservation fsync 和 allocator transaction
-收进同一个 crate（可将 `otp-book` 作为内部模块，或将 allocator 的 transaction
-移入 `otp-book`），对外只暴露 `SegmentIssuer::issue() -> CommittedSegment`。
-`read_segment` 保持真正私有/`pub(crate)`，外部模拟 crate 无法调用任何裸读取路径。
-代价是调整 crate 依赖图和规划 §2.1，改动面较大但边界是真实的。
+### 方案 B——修订规划 §4.1
 
-### B：修订 §4.1 为 capability/API 约束
-保留独立 crate 和公开桥接入口，但将规范明确改为：入口是唯一公开生产 API，
-入口内部只能在传入的受验证 reservation proof 后读取；增加 API 审计、负向
-编译测试验证 `read_segment` 和裸暴露符号不存在，而不宣称“仅 allocator”。
-代价是不能满足“其它 workspace crate 编译必失败”的强验收，安全边界依赖 API
-设计与 review，需安全审计明确接受。
+保留独立 crate 的唯一公开桥接 API，并以 reservation proof/API 审计约束调用；同时明确这不是“仅 otp-allocator 可调用”的编译级权限边界。该方案不能满足当前验收标准 1/2，必须由调度与安全审计明确放宽后实施。
 
-## 环境阻塞
+## zeroize 生命周期复核
 
-当前执行环境未发现 `cargo` 或 `rustc`（`command -v cargo`、`command -v rustc`
-均无输出，`~/.cargo/bin/cargo` 与 `~/.cargo/bin/rustc` 不存在），因此不能诚实
-声称 `scripts/quality-gate.sh` 或 `cargo test -p otp-allocator` 已运行。
+未重构源码，故没有破坏现有生命周期：
 
-## 状态
+- `otp-book::Segment` 仍由 `#[derive(ZeroizeOnDrop)]` 管理，未实现 `Clone`/`Debug`/序列化；
+- `otp-allocator::CommittedSegment` 仍由 `#[derive(ZeroizeOnDrop)]` 管理，未实现 `Clone`/`Debug`/序列化；
+- 现有 allocator 在 `issue()` 中仅在最终双锚 fsync 成功后构造并返回 `CommittedSegment`；
+- 因未执行方案 A/B，不能声称已完成任务 #43 的代码验收。
 
-- 已从基线创建本地分支：`principal/task-43`。
-- 未修改源代码，未删除公开入口，未提交或推送不满足规范的半成品。
-- 等调度 @小雪 / 安全决策确认选项 A 或 B 后继续。
+## 验证阻塞
+
+当前环境没有可用的 `cargo`/`rustc`（包括 `~/.cargo/bin`），因此未虚报 `scripts/quality-gate.sh` 或 `cargo test -p otp-allocator` 输出。待调度拍板方案 A 或 B、并补齐工具链后再执行验证。
+
+请 @小雪 调度升级 @芥末 拍板。未获裁决前不删除裸入口、不改名伪装、不提交不满足负向编译验收的实现。
