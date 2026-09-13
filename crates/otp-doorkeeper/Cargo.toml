@@ -1,0 +1,31 @@
+[package]
+name = "otp-doorkeeper"
+description = "jbuu doorkeeper：SSH 过渡兼容垫（RFC 4253 §4.2 前置警告行 + 双向原样 pipe，thread-per-conn）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "otp_doorkeeper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jbuu-doorkeeper"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+# socket 选项（IPV6_V6ONLY / SO_KEEPALIVE+TCP_KEEP* / SO_SNDTIMEO）：workspace 既有同步
+# 系统调用基线（设计书 §2.1 方案 A 优点栏明示“与栈内既有同步 I/O 风格 rustix 一致”），
+# 纯 safe 封装，配合 crate 全域 #![forbid(unsafe_code)]。这是对 §2.3“生产依赖仅 std+clap”
+# 的唯一必要补充：std::net 不暴露上述 socket 选项，而 D7/D10 冻结裁决强制要求设置它们。
+rustix = { workspace = true, features = ["net"] }
+# SIGHUP 日志轮转 reopen + SIGTERM/SIGINT 优雅退出（§5.5/§6.2）：同步信号迭代器，无异步运行时。
+signal-hook = "0.3"
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json = "1"
+sha2.workspace = true
