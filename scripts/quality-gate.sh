@@ -3,10 +3,11 @@
 #
 # 用法：
 #   ./scripts/quality-gate.sh                # fmt / clippy / test / unsafe 检查 / deny(licenses,bans,sources)
-#   SKIP_DENY=1 ./scripts/quality-gate.sh    # 跳过 cargo-deny（无该工具时）
+#   SKIP_DENY=1 ./scripts/quality-gate.sh    # 显式跳过 cargo-deny（特殊环境临时用，交付帖须注明）
 #   DENY_ADVISORIES=1 ./scripts/quality-gate.sh  # 附加 advisories（需联网拉漏洞库）
 #
-# 全绿要求：五项检查全部通过（SKIP_DENY 时为四项，须在交付帖注明）。
+# 全绿要求：五项检查全部通过；deny 项为默认必跑（工具缺失即 FAIL，不再静默跳过；
+# SKIP_DENY=1 时为四项，且必须在交付帖注明）——v0.1 发布前置（任务 #60）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,19 +47,19 @@ run_check "unsafe 检查（allocator/recovery/session）" bash scripts/check-uns
 
 # 5. cargo deny（依赖许可/禁用/来源；advisories 需联网）
 if command -v cargo-deny >/dev/null 2>&1; then
-    checks="${DENY_CHECKS:-licenses bans sources}"
-    if [[ "${DENY_ADVISORIES:-0}" == "1" ]]; then
-        checks="advisories $checks"
-    fi
-    # shellcheck disable=SC2086
-    run_check "cargo deny check ($checks)" cargo deny check --hide-inclusion-graph $checks
-else
     if [[ "${SKIP_DENY:-0}" == "1" ]]; then
-        printf '\033[33m[SKIP]\033[0m cargo-deny（SKIP_DENY=1）\n'
+        printf '\033[33m[SKIP]\033[0m cargo-deny（SKIP_DENY=1 显式跳过，交付帖须注明）\n'
     else
-        fail "cargo-deny 不可用（安装：cargo install cargo-deny --locked；或 SKIP_DENY=1 显式跳过并在交付帖注明）"
-        overall=1
+        checks="${DENY_CHECKS:-licenses bans sources}"
+        if [[ "${DENY_ADVISORIES:-0}" == "1" ]]; then
+            checks="advisories $checks"
+        fi
+        # shellcheck disable=SC2086
+        run_check "cargo deny check ($checks)" cargo deny check --hide-inclusion-graph $checks
     fi
+else
+    fail "cargo-deny 不可用（安装：cargo install cargo-deny --locked）；deny 项为默认必跑，装不上即本门不绿（旧版 SKIP_DENY=1 兜底已移除，工具缺失不再有静默跳过出口）"
+    overall=1
 fi
 
 step "总结"

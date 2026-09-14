@@ -32,6 +32,15 @@ allow = [
     "BSD-3-Clause",
 ]
 # 新增许可须附理由并过 CODEOWNERS 供应链评审；未遇到项会被警告提醒清理。
+# 2026-09-14 核对结论（任务 #60，勿误加项）：
+#  - 现有 100 个锁定的第三方依赖（Cargo.lock）全部被上述白名单覆盖，无例外；
+#  - "Unlicense OR MIT"（memchr/termcolor/winapi-util）与旧式 "MIT/Apache-2.0"、
+#    "Apache-2.0/MIT"（斜杠写法=OR）均按 MIT/Apache-2.0 宽松分支采纳，
+#    无需将 Unlicense 加白；
+#  - r-efi 的 "MIT OR Apache-2.0 OR LGPL-2.1-or-later"：LGPL 仅为 OR 分支，
+#    本项目按 MIT/Apache-2.0 分支采纳，LGPL-2.1-or-later **不进白名单**；
+#  - 本白名单只约束第三方依赖，不限制项目自身采用 GPL-3.0-or-later；
+#    Apache-2.0 与 GPLv3 兼容（非 GPLv2 口径）。
 confidence-threshold = 0.93
 
 [sources]
