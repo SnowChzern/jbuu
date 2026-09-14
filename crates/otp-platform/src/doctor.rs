@@ -5,7 +5,7 @@
 //! （纯函数）两层，正反用例在纯函数层穷举，采集层另以真实环境断言形状。
 //!
 //! 高风险（`Block`）条件按策略**拒绝启动**：`DoctorReport::refuse_startup`
-//! 汇总；CLI（`otp-term serve/connect`）在加载任何段材料前调用并以此
+//! 汇总；CLI（`jbuu serve/connect`）在加载任何段材料前调用并以此
 //! 判定。
 //!
 //! `harden_process`：serve/connect 启动自加固——`RLIMIT_CORE=0` +
@@ -380,8 +380,14 @@ pub const fn eval_perm(f: &PermFacts, euid: u32, need_write: bool) -> CheckStatu
 // ───────────────────────── 备份风险（§5 测试 13） ─────────────────────────
 
 /// 备份排除标记文件名（放置于密码本所在目录；运维按 §5 测试 13 的
-/// canary/exclusion 流程创建）。
-pub const NO_BACKUP_MARKER: &str = ".otp-term-nobackup";
+/// canary/exclusion 流程创建）。v0.1.1 起主名 `.jbuu-nobackup`（任务
+/// #62 改名）；旧名仍被识别（见 [`NO_BACKUP_MARKER_LEGACY`]）。
+pub const NO_BACKUP_MARKER: &str = ".jbuu-nobackup";
+
+/// v0.1 旧排除标记文件名（二进制旧名 otp-term 时代口径）。v0.1 已部署
+/// 站点按当时 runbook 放置的标记继续有效——两个名字任一存在即视为
+/// 已显式声明备份风险，避免纯改名 patch 把存量站点 doctor 打回 BLOCK。
+pub const NO_BACKUP_MARKER_LEGACY: &str = ".otp-term-nobackup";
 
 /// 已知同步/备份工具目录名（组件级匹配，大小写不敏感）。
 const SYNC_DIR_COMPONENTS: &[&str] = &[
@@ -415,7 +421,9 @@ pub fn collect_backup_facts(book: &Path) -> BackupFacts {
         .map(|c| c.to_string());
     let marker_present = book
         .parent()
-        .map(|dir| dir.join(NO_BACKUP_MARKER).exists())
+        .map(|dir| {
+            dir.join(NO_BACKUP_MARKER).exists() || dir.join(NO_BACKUP_MARKER_LEGACY).exists()
+        })
         .unwrap_or(false);
     BackupFacts {
         sync_dir_hit: hit,
@@ -814,12 +822,19 @@ mod tests {
         // 建标记后。
         std::fs::write(dir.join(NO_BACKUP_MARKER), b"").unwrap();
         assert!(collect_backup_facts(&book).marker_present);
+        // 旧名标记（v0.1 站点兼容，#62 改名）：单独存在同样被识别。
+        std::fs::remove_file(dir.join(NO_BACKUP_MARKER)).unwrap();
+        assert!(!collect_backup_facts(&book).marker_present);
+        std::fs::write(dir.join(NO_BACKUP_MARKER_LEGACY), b"").unwrap();
+        assert!(collect_backup_facts(&book).marker_present);
+        std::fs::remove_file(dir.join(NO_BACKUP_MARKER_LEGACY)).unwrap();
         // 同步目录命中（组件级）。
         let sync = dir.join("Dropbox");
         std::fs::create_dir_all(&sync).unwrap();
         let hit = collect_backup_facts(&sync.join("b.bin"));
         assert_eq!(hit.sync_dir_hit.as_deref(), Some("Dropbox"));
         std::fs::remove_file(dir.join(NO_BACKUP_MARKER)).ok();
+        std::fs::remove_file(dir.join(NO_BACKUP_MARKER_LEGACY)).ok();
         std::fs::remove_file(&book).ok();
         std::fs::remove_dir_all(&dir).ok();
     }

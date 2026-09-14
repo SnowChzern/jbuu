@@ -1,5 +1,5 @@
 //! WP-15 验收 ②④ + WP-16 终端数据面（TCP 半 + doctor/审计面）：**真实
-//! `otp-term` 二进制**双进程经 localhost TCP（中继录制全部流经字节）完成
+//! `jbuu` 二进制**双进程经 localhost TCP（中继录制全部流经字节）完成
 //! 端到端加密**交互式 PTY 终端**会话。
 //!
 //! 断言（PTY 终端口径，任务 #54）：
@@ -38,7 +38,7 @@ const CHUNKS: usize = 4; // 256 KiB（二进制 e2e 用量；loopback 侧另有 
 const DEADLINE: Duration = Duration::from_secs(180);
 
 fn exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_otp-term"))
+    PathBuf::from(env!("CARGO_BIN_EXE_jbuu"))
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -99,7 +99,7 @@ fn write_init_anchors(dir: &Path, id: BookId) -> (PathBuf, PathBuf) {
 }
 
 fn write_no_backup_marker(dir: &Path) {
-    std::fs::write(dir.join(".otp-term-nobackup"), b"ops marker\n").unwrap();
+    std::fs::write(dir.join(".jbuu-nobackup"), b"ops marker\n").unwrap();
 }
 
 fn marker(i: usize) -> [u8; 16] {

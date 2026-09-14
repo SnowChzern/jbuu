@@ -104,7 +104,7 @@ pub fn write_no_backup_marker(book: &Path) -> Result<PathBuf, String> {
     }
     std::fs::write(
         &marker,
-        b"otp-term: book/anchors excluded from backups (ops marker)\n",
+        b"jbuu: book/anchors excluded from backups (ops marker)\n",
     )
     .map_err(|_| "排除标记写入失败".to_string())?;
     Ok(marker)

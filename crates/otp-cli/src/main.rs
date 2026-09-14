@@ -1,4 +1,4 @@
-//! # otp-term CLI —— 运维入口（WP-15，任务 #52）
+//! # jbuu CLI —— 运维入口（WP-15，任务 #52；二进制名自 v0.1.1 起 otp-term→jbuu，任务 #62）
 //!
 //! 实现规划 §2 职责：server/client、book inspect/generate（仅离线测试或
 //! 受控工具）、anchor inspect、doctor、drain/rotate 骨架。
@@ -52,7 +52,7 @@ const CONNECT_PING_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "otp-term",
+    name = "jbuu",
     version,
     about = "OTP 密码本池终端协议 CLI（serve/connect/doctor/inspect；drain/rotate 为 WP-17 骨架）"
 )]
@@ -230,7 +230,7 @@ fn main() {
     match run(cli.command) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("otp-term: {e}");
+            eprintln!("jbuu: {e}");
             std::process::exit(match &e {
                 CliError::Exit(code, _) => *code,
             });
@@ -311,7 +311,7 @@ fn run(cmd: Cmd) -> Result<(), CliError> {
                 }
             };
             let outcome = {
-                // 与 serve/connect 同口径：先自加固再体检（报告的是 otp-term
+                // 与 serve/connect 同口径：先自加固再体检（报告的是 jbuu
                 // 进程加固后的真实达阵状态）。
                 otp_platform::harden_process().map_err(|why| {
                     CliError::Exit(EXIT_POLICY_REFUSED, format!("自加固失败：{why}"))
@@ -911,11 +911,11 @@ mod tests {
 
     #[test]
     fn command_surface_parses() {
-        let cli = Cli::try_parse_from(["otp-term", "doctor"]).expect("doctor 可解析");
+        let cli = Cli::try_parse_from(["jbuu", "doctor"]).expect("doctor 可解析");
         assert!(matches!(cli.command, Cmd::Doctor { .. }));
 
         let cli = Cli::try_parse_from([
-            "otp-term",
+            "jbuu",
             "serve",
             "--book",
             "b.book",
@@ -930,7 +930,7 @@ mod tests {
         assert!(matches!(cli.command, Cmd::Serve { .. }));
 
         let cli = Cli::try_parse_from([
-            "otp-term",
+            "jbuu",
             "connect",
             "--book",
             "b.book",
@@ -945,7 +945,7 @@ mod tests {
         assert!(matches!(cli.command, Cmd::Connect { .. }));
 
         let cli = Cli::try_parse_from([
-            "otp-term",
+            "jbuu",
             "doctor",
             "--book",
             "b.book",
@@ -958,11 +958,11 @@ mod tests {
         .expect("doctor 带路径可解析");
         assert!(matches!(cli.command, Cmd::Doctor { json: true, .. }));
 
-        let cli = Cli::try_parse_from(["otp-term", "drain"]).expect("drain 可解析");
+        let cli = Cli::try_parse_from(["jbuu", "drain"]).expect("drain 可解析");
         assert!(matches!(cli.command, Cmd::Drain));
 
         let cli = Cli::try_parse_from([
-            "otp-term",
+            "jbuu",
             "rotate",
             "--book-id",
             "00112233445566778899aabbccddeeff",
@@ -976,7 +976,7 @@ mod tests {
         .expect("rotate 骨架参数面可解析");
         assert!(matches!(cli.command, Cmd::Rotate { .. }));
 
-        let cli = Cli::try_parse_from(["otp-term", "anchor", "inspect", "a.anchor"])
+        let cli = Cli::try_parse_from(["jbuu", "anchor", "inspect", "a.anchor"])
             .expect("anchor inspect 单锚可解析");
         assert!(matches!(
             cli.command,
@@ -986,7 +986,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from([
-            "otp-term", "anchor", "inspect", "a.anchor", "b.anchor", "--json",
+            "jbuu", "anchor", "inspect", "a.anchor", "b.anchor", "--json",
         ])
         .expect("anchor inspect 双锚可解析");
         assert!(matches!(
@@ -996,15 +996,8 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from([
-            "otp-term",
-            "book",
-            "generate",
-            "out.book",
-            "--segments",
-            "3",
-        ])
-        .expect("book generate 可解析");
+        let cli = Cli::try_parse_from(["jbuu", "book", "generate", "out.book", "--segments", "3"])
+            .expect("book generate 可解析");
         assert!(matches!(
             cli.command,
             Cmd::Book {
@@ -1012,7 +1005,7 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from(["otp-term", "book", "inspect", "b.book", "--json"])
+        let cli = Cli::try_parse_from(["jbuu", "book", "inspect", "b.book", "--json"])
             .expect("book inspect --json 可解析");
         assert!(matches!(
             cli.command,

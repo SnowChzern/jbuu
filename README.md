@@ -39,17 +39,17 @@
 
 ```bash
 cargo build --release
-# 二进制：target/release/otp-term
+# 二进制：target/release/jbuu
 ```
 
 工具链：Rust 1.85+（见 `rust-toolchain.toml`），零 unsafe（编译期强制）。
 
 ```
-otp-term serve --book <密码本> --anchor-a <锚A> --anchor-b <锚B> --listen <host:port>
-otp-term connect --book <同一本密码本> --target <host:port>
+jbuu serve --book <密码本> --anchor-a <锚A> --anchor-b <锚B> --listen <host:port>
+jbuu connect --book <同一本密码本> --target <host:port>
 ```
 
-密码本由 `otp-term book generate` 生成（OS CSPRNG），服务端与客户端各持同一本的
+密码本由 `jbuu book generate` 生成（OS CSPRNG），服务端与客户端各持同一本的
 独立副本，通过线下介质分发。**密码本本体永远不进 git、不进备份系统。**
 
 ## License

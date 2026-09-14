@@ -383,14 +383,14 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "otp-allocator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-book",
 ]
 
 [[package]]
 name = "otp-anchor-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-types",
  "sha2",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "otp-book"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "otp-anchor-spec",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "otp-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "otp-allocator",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "otp-codec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-types",
  "proptest",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "otp-doorkeeper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "proptest",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "otp-handshake"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "otp-allocator",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "otp-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "otp-types",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "otp-recovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-anchor-spec",
  "otp-platform",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "otp-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "otp-types",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "otp-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-codec",
  "otp-handshake",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "otp-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "otp-allocator",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "otp-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otp-allocator",
  "otp-anchor-spec",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "otp-types"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "poly1305"

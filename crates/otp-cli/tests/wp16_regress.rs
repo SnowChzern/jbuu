@@ -5,7 +5,7 @@
 //! - F1（严重）纯输出长流：客户端泵按 ping_interval **无条件**发 Ping
 //!   （与输出活动解耦）→ 无键入的连续输出超过 lease 也不再被
 //!   LeaseExpired 中途逐出。本测试走真实泵（`run_interactive`，静默
-//!   stdin——与 `otp-term connect` 管道形态同构）。
+//!   stdin——与 `jbuu connect` 管道形态同构）。
 //! - F2（阻断）单帧大输入：服务端按 ≤PTY_WRITE_SLICE 分片写 master 并
 //!   在片间排空回显 → 回显即时流出（不再楔死）、服务端线程正常终止、
 //!   租约锁不被无限持有（并发 acquire 即时返回 Busy）。

@@ -1,6 +1,6 @@
 # 第三方依赖 NOTICE 清单（THIRD-PARTY-NOTICE）
 
-项目 **otp-term** 以 **GPL-3.0-or-later** 发布（根目录 LICENSE）。本清单按
+项目 **jbuu**（锦书；仓库名 `otp-term` 沿用，公开仓同步归调度）以 **GPL-3.0-or-later** 发布（根目录 LICENSE）。本清单按
 `Cargo.lock`（基线 commit `617a3a4`，生成日 2026-09-14）**全量**列出
 全部第三方 Rust 依赖（crates.io 来源，直接 + 传递依赖，共 **100** 个条目：
 直接声明 11 种、lock 中 13 条（getrandom 锁 3 个版本），传递 87 条；另 14 个

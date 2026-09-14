@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
@@ -15,19 +15,19 @@ publish = false
 # 升级依赖 = 更新 Cargo.lock 并过质量门（scripts/quality-gate.sh）。
 [workspace.dependencies]
 # 内部 crate（路径依赖，依赖方向受规划 §2.1 依赖图约束）
-otp-types = { path = "crates/otp-types", version = "0.1.0" }
-otp-codec = { path = "crates/otp-codec", version = "0.1.0" }
-otp-book = { path = "crates/otp-book", version = "0.1.0" }
-otp-anchor-spec = { path = "crates/otp-anchor-spec", version = "0.1.0" }
-otp-allocator = { path = "crates/otp-allocator", version = "0.1.0" }
-otp-recovery = { path = "crates/otp-recovery", version = "0.1.0" }
-otp-handshake = { path = "crates/otp-handshake", version = "0.1.0" }
-otp-session = { path = "crates/otp-session", version = "0.1.0" }
-otp-transport = { path = "crates/otp-transport", version = "0.1.0" }
-otp-terminal = { path = "crates/otp-terminal", version = "0.1.0" }
-otp-platform = { path = "crates/otp-platform", version = "0.1.0" }
-otp-cli = { path = "crates/otp-cli", version = "0.1.0" }
-otp-testkit = { path = "crates/otp-testkit", version = "0.1.0" }
+otp-types = { path = "crates/otp-types", version = "0.1.1" }
+otp-codec = { path = "crates/otp-codec", version = "0.1.1" }
+otp-book = { path = "crates/otp-book", version = "0.1.1" }
+otp-anchor-spec = { path = "crates/otp-anchor-spec", version = "0.1.1" }
+otp-allocator = { path = "crates/otp-allocator", version = "0.1.1" }
+otp-recovery = { path = "crates/otp-recovery", version = "0.1.1" }
+otp-handshake = { path = "crates/otp-handshake", version = "0.1.1" }
+otp-session = { path = "crates/otp-session", version = "0.1.1" }
+otp-transport = { path = "crates/otp-transport", version = "0.1.1" }
+otp-terminal = { path = "crates/otp-terminal", version = "0.1.1" }
+otp-platform = { path = "crates/otp-platform", version = "0.1.1" }
+otp-cli = { path = "crates/otp-cli", version = "0.1.1" }
+otp-testkit = { path = "crates/otp-testkit", version = "0.1.1" }
 
 # 系统调用（pread/fsync/文件锁/目录同步；业务层禁散落裸 unsafe，规划 §1.2）
 rustix = { version = "1.0", default-features = false, features = ["std", "fs"] }
