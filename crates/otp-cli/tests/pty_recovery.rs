@@ -5,7 +5,9 @@
 //! - **同一 PTY 存活**：恢复连接附着旧句柄，shell 状态可读；
 //! - **并发恢复各得不同段 + 单主**：双客户端 barrier 竞争附着，恰一胜者
 //!   （另一 `LeaseHeldByOther`），随后断线接管 token 递增
-//!   （规划 §5 测试 10 全栈口径）；
+//!   （规划 §5 测试 10 全栈口径）；竞争者各持**独立客户端分配器**
+//!   （`Ends::racer_ends`，F6 修复：握手套件不在持跨连接共享锁状态下
+//!   做阻塞网络 I/O，见竞争测试处注释）；
 //! - **恢复 token 只能是索引/句柄**：句柄恒为注册表计数器（跨会话不变），
 //!   与段号推进无关联；
 //! - **明文不出传输层**：WireTap 旁录不含终端明文与段正文。
@@ -127,7 +129,47 @@ fn tapped_pair() -> ((LoopbackTransport, LoopbackTransport), WireTap) {
     LoopbackTransport::new_pair_tapped()
 }
 
+/// 竞争者专用端点栈：服务端侧（注册表/服务端分配器/端点参数）保持共享，
+/// 客户端侧换成**独立分配器**（独立 book + 初始锚，内容与主客户端本一致）。
+///
+/// F6 修复（试金 R2）：修复前两个竞争线程共享 `client_alloc` 互斥锁跨
+/// 整个阻塞网络握手，与服务端共享 `server_alloc` 交叉调度成 ABBA 四边
+/// 互等环——racer_A 持 client_alloc 等对端 serve_A → serve_A 等
+/// server_alloc（serve_B 持有跨整个握手）→ serve_B 等 racer_B 的 HELLO
+/// → racer_B 等 client_alloc（racer_A 持有）——环上握手全部停滞，30s
+/// DEADLINE 破环 → 质量门概率性翻红（f74cad3 上 35 跑 5 红）。
+///
+/// 独立分配器即真实产品拓扑：并发的第二条恢复连接只能来自另一个客户
+/// 端进程——各自持独立锚状态（同机同锚文件会在分配器 OFD 锁上
+/// fail-closed，不存在两进程共享同一内存分配器）。换独立分配器后，
+/// 客户端侧握手不再持任何跨连接共享锁；唯一跨网络 I/O 的共享锁只剩
+/// 服务端分配器——与产品 `serve_one` 同款（F7 观测，串行有界无环）。
+/// 竞争者本地锚指针（0）落后于服务端（1/2）→ ARBITRATE SERVER_AHEAD
+/// 跳段采纳（wp01 H3 产品正路，h3 状态机测试覆盖）；各连接约定段仍由
+/// 共享服务端分配器在锁内串行签发——段号互异不变，恰一主/fencing
+/// 断言原样保留。
+fn racer_ends(ends: &Ends, tag: &str) -> Ends {
+    let mut e = ends.clone();
+    let dir = scratch(tag);
+    let book = write_test_book(&dir, 0x11);
+    let (a, b) = write_init_anchors(&dir);
+    e.client_alloc = Arc::new(Mutex::new(
+        otp_allocator::Allocator::open(otp_allocator::AllocatorConfig {
+            book,
+            anchor_a: a,
+            anchor_b: b,
+            expected_book_id: ID,
+        })
+        .expect("竞争者分配器"),
+    ));
+    e
+}
+
 /// 服务端连接线程：完整 WP-11 握手（重新仲裁+签发新段）→ WP-16 终端服务。
+///
+/// 握手期间持共享 `server_alloc`（与产品 `serve_one` 同款：服务端分配
+/// 器唯一、握手串行、有界等待）。客户端侧永不阻塞在服务端分配器上
+/// （各连接独立客户端分配器，见 `racer_ends`），故无互等环。
 fn serve_thread(ends: &Ends, io: LoopbackTransport) -> std::thread::JoinHandle<ServeSummary> {
     let ends = ends.clone();
     std::thread::spawn(move || {
@@ -298,16 +340,23 @@ fn concurrent_recovery_races_single_master_and_distinct_segments() {
 
     // 两个恢复连接：各自**先完成新握手（各签发不同段）**，再 barrier
     // 同放竞争 lease（附着时单主仲裁）。
+    //
+    // F6 修复：竞争者各持独立客户端分配器（旧夹具两线程共享
+    // `client_alloc` 锁跨阻塞握手 → 与服务端 `server_alloc` 成 ABBA
+    // 四边互等环，详见 `racer_ends` 注释）。竞争断言语义不变：
+    // 恰一主/段号互异/fencing 全部原样。
     let barrier = Arc::new(Barrier::new(2));
     let mut racers = Vec::new();
-    for _ in 0..2 {
+    for n in 0..2 {
         let ((c, s), tap) = tapped_pair();
         taps.push(tap);
         let server = serve_thread(&ends, s);
-        let ends2 = ends.clone();
+        let ends2 = racer_ends(&ends, &format!("race-r{n}"));
         let barrier2 = Arc::clone(&barrier);
         racers.push(std::thread::spawn(move || {
             // 握手先行（新段签发与竞争无关：恢复必先重新仲裁）。
+            // `ends2.client_alloc` 为本竞争者独占：持锁跨网络 I/O 不再
+            // 与其他连接交叉（F6）。
             let mut c = c;
             let (session, info) = {
                 let mut alloc = ends2.client_alloc.lock().unwrap();
