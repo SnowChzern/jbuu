@@ -27,6 +27,8 @@ MESH_IP=192.0.2.10          # server 在 mesh VPN 内的地址（仅此网段可
 MESH_CIDR=192.0.2.0/24      # mesh 子网（防火墙白名单用）
 SRV_PORT=7717               # otp-term serve 监听端口（mesh 内自定，避开 22/2222/2223）
 CLIENT_IP=192.0.2.20        # 客户端在 mesh 内的地址（演练/验证用）
+SRV_PUBLIC=203.0.113.10     # server 对外（公网）地址——仅 doorkeeper 验证/负面检查用；示例为 RFC 5737 段
+SSH_USER=ops                # doorkeeper 验证用的 SSH 登录用户名（按实际账号替换）
 ```
 
 ### 0.3 主机前提（两侧通用）
@@ -72,7 +74,9 @@ sudo /opt/jbuu/v0.1/otp-term book generate /var/lib/jbuu/otp.book --segments 102
 锚必须**先于** serve 存在（缺失 → serve 拒绝启动，绝不顺手创建空锚毁现场）。用下面脚本从 book_id 确定性生成（构造与仓内 `AnchorRecord::init`+`encode_record` 逐字节一致：`OTPA`+版本 2+tag 0+book_id，generation/next/保留区全零，尾接 SHA256 完整性）：
 
 ```sh
-BOOK_ID=<上面记录的 32 位十六进制>          # 例：a1b2…（照抄 2.2 输出，非占位符）
+BOOK_ID=$(/opt/jbuu/v0.1/otp-term book inspect /var/lib/jbuu/otp.book --json \
+  | grep -o '"book_id": *"[0-9a-f]\{32\}"' | grep -o '[0-9a-f]\{32\}')
+echo "BOOK_ID=$BOOK_ID"                                     # ✅ 与 2.2 输出一致
 sudo python3 - "$BOOK_ID" <<'PY'
 import hashlib, os, sys
 bid = bytes.fromhex(sys.argv[1]); assert len(bid) == 16, "book_id 须 32 hex"
@@ -111,7 +115,7 @@ sudo /opt/jbuu/v0.1/otp-term serve --book /var/lib/jbuu/otp.book \
   --listen "${MESH_IP}:${SRV_PORT}" --audit-log /var/log/jbuu/serve-audit.jsonl
 # stderr 期望顺序：doctor 各行 → READY next=0 generation=0
 #                → TERMINAL-SERVE shell=["/bin/sh"] lease_timeout_ms=15000
-#                → LISTEN=<MESH_IP>:<SRV_PORT>
+#                → LISTEN=$MESH_IP:$SRV_PORT（实际展开值）
 # 看到 LISTEN= 即就绪；Ctrl-C 停止（v0.1 无 drain，停止即断存量连接）
 ```
 
@@ -188,10 +192,10 @@ sudo ss -tlnp | grep "$SRV_PORT"                                # 期望仅绑�
 # 从 mesh 内另一台机（客户端）：
 nc -zv -w3 "$MESH_IP" "$SRV_PORT"                               # 期望 succeeded
 # 从公网侧（非 mesh 出口）对 server 公网地址：
-nc -zv -w3 <server公网地址> "$SRV_PORT"                          # 期望 refused/timeout（禁公网暴露铁律）
+nc -zv -w3 "$SRV_PUBLIC" "$SRV_PORT"                             # 期望 refused/timeout（禁公网暴露铁律）
 ```
 
-> `<server公网地址>` 处填本机唯一公网地址后执行；该项是**验证禁止项成立**的负面检查。
+> 该项是**验证禁止项成立**的负面检查（§0.2 的 SRV_PUBLIC）。
 
 ## 4. server 侧：doorkeeper 部署（SSH 过渡垫，独立于 §2–§3）
 
@@ -233,12 +237,12 @@ sudo systemctl stop jbuu-doorkeeper.service
 sudo /usr/local/bin/jbuu-doorkeeper --listen [::]:2223 --upstream 127.0.0.1:2222 \
   --log-file /var/log/jbuu/doorkeeper.log --verbose &
 # 从外部主机：
-ssh -p 2223 -v user@<server地址> true                           # 登录成功；-v 可见 banner line 0: NOTICE: SSH endpoint deprecated…
+ssh -p 2223 -v "${SSH_USER}@${SRV_PUBLIC}" true                 # 登录成功；-v 可见 banner line 0: NOTICE: SSH endpoint deprecated…
 sudo grep -c conn_accept /var/log/jbuu/doorkeeper.log           # 期望 ≥1，事件链 conn_accept→warn_sent→upstream_connect→client_version→conn_close
 sudo pkill -x jbuu-doorkeeper
 ```
 
-> `<server地址>` 处填本机对外可达地址后执行（外部视角验证）。矩阵里可得的其他客户端（PuTTY/dropbear/paramiko/Go 工具）此时各连一次（设计书 §4.1）。
+> 用 §0.2 的 SRV_PUBLIC/SSH_USER 从外部视角验证。矩阵里可得的其他客户端（PuTTY/dropbear/paramiko/Go 工具）此时各连一次（设计书 §4.1）。
 
 ### 4.4 切换窗口（唯一中断面 = 数秒新连接拒绝；按序逐条）
 
@@ -280,9 +284,9 @@ sudo nft add rule inet jbuu-ssh input tcp dport 2222 iif != "lo" drop
 
 ```sh
 # 外部主机执行：
-ssh -p 22 user@<server地址> 'echo via-doorkeeper-ok'            # ✅ 经门卫登录成功
-scp -P 22 local-file user@<server地址>:/tmp/ && echo scp-ok     # ✅ 传文件成功
-ssh -p 2222 user@<server地址> true                              # ❌ 应拒绝（收缩生效）
+ssh -p 22 "${SSH_USER}@${SRV_PUBLIC}" 'echo via-doorkeeper-ok'   # ✅ 经门卫登录成功
+scp -P 22 local-file "${SSH_USER}@${SRV_PUBLIC}":/tmp/ && echo scp-ok  # ✅ 传文件成功
+ssh -p 2222 "${SSH_USER}@${SRV_PUBLIC}" true                     # ❌ 应拒绝（收缩生效）
 # server 本机执行：
 sudo ss -tlnp | grep -E ':22 |:2222'                            # :22=jbuu-doorkeeper；2222 仅回环
 sudo systemctl stop jbuu-doorkeeper.service
@@ -299,7 +303,7 @@ sudo sed -i -e '/ListenAddress 127.0.0.1:2222/d;/ListenAddress \[::1\]:2222/d;/^
 sudo rm -f /etc/ssh/jbuu-migration-banner.txt
 # 恢复原 Port/ListenAddress（取消注释 4.4a 注释掉的行）
 sudo sshd -t && sudo systemctl reload sshd
-ssh -p 22 user@<server地址> true && echo rollback-ok            # 外部 :22 直连 sshd 复验
+ssh -p 22 "${SSH_USER}@${SRV_PUBLIC}" true && echo rollback-ok     # 外部 :22 直连 sshd 复验
 ```
 
 ### 4.9 日志轮转与仪表盘、日落
@@ -344,7 +348,8 @@ echo '30 0 * * * root /usr/local/bin/jbuu-doorkeeper-daily.sh' | sudo tee /etc/c
 ```sh
 mkdir -p ~/jbuu-cli && cd ~/jbuu-cli
 cp /path/to/收到的/otp.book ./otp.book && chmod 600 otp.book
-BOOK_ID=<随件收到的 32 位十六进制>
+BOOK_ID=$(./otp-term book inspect otp.book --json | grep -o '"book_id": *"[0-9a-f]\{32\}"' | grep -o '[0-9a-f]\{32\}')
+echo "BOOK_ID=$BOOK_ID"                                     # ✅ 与随件单据一致
 python3 - "$BOOK_ID" <<'PY'
 import hashlib, os, sys
 bid = bytes.fromhex(sys.argv[1]); assert len(bid) == 16, "book_id 须 32 hex"
