@@ -3,8 +3,9 @@
 项目 **jbuu**（锦书；仓库名 `otp-term` 沿用，公开仓同步归调度）以 **GPL-3.0-or-later** 发布（根目录 LICENSE）。本清单按
 `Cargo.lock`（基线 commit `617a3a4`，生成日 2026-09-14）**全量**列出
 全部第三方 Rust 依赖（crates.io 来源，直接 + 传递依赖，共 **100** 个条目：
-直接声明 11 种、lock 中 13 条（getrandom 锁 3 个版本），传递 87 条；另 14 个
-`otp-*` 为本 workspace 内部 crate，属本项目自身，不在此列）。
+直接声明 12 种、lock 中 14 条（getrandom 锁 3 个版本），传递 86 条；另 15 个
+`otp-*` 为本 workspace 内部 crate，属本项目自身，不在此列。2026-09-15 任务
+#75 变更：`poly1305` 由传递升为直接依赖（otp-fullotp），总数 100 不变）。
 
 每条 license 均为上游发布清单（crates.io 索引元数据）中的**原始 license 字段**，
 未做改写。本项目发布物如随附这些依赖（源码或编译产物），须遵守对应许可条款：
@@ -100,7 +101,7 @@ MIT/Apache-2.0/BSD/Unicode 等均要求保留版权与许可声明（Apache-2.0 
 | 43 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | 传递 |
 | 44 | `once_cell_polyfill` | 1.70.2 | MIT OR Apache-2.0 | 传递 |
 | 45 | `opaque-debug` | 0.3.1 | MIT OR Apache-2.0 | 传递 |
-| 46 | `poly1305` | 0.8.0 | Apache-2.0 OR MIT | 传递 |
+| 46 | `poly1305` | 0.8.0 | Apache-2.0 OR MIT | 直接 |
 | 47 | `ppv-lite86` | 0.2.21 | MIT OR Apache-2.0 | 传递 |
 | 48 | `proc-macro2` | 1.0.107 | MIT OR Apache-2.0 | 传递 |
 | 49 | `proptest` | 1.11.0 | MIT OR Apache-2.0 | 直接 |

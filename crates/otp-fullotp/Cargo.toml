@@ -1,0 +1,30 @@
+# otp-fullotp —— FULL_OTP_POLY1305 数据面（任务 #75 批1+批2）
+#
+# 唯一设计依据：docs/specs/fullotp-design.md（任务 #68，芥末已批）§2/§3/§4。
+# 本 crate 只实现数据面（线格式/bundle/一次性 Poly1305/数据泵/reserve_range 消费侧），
+# 不做握手挂载与 CLI（等 CLI redesign 批准后另卡）。
+[package]
+name = "otp-fullotp"
+description = "OTP 终端协议：FULL_OTP_POLY1305 数据面（OTP_DATA 线格式/bundle/一次性 Poly1305/数据泵）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+otp-types.workspace = true
+# 一次性 Poly1305（RustCrypto universal hash；经 NCC Group 审计，clamp 在 KeyInit 内完成，
+# 与 chacha20poly1305 的 AEAD Poly1305 不是同一构造——设计书 §5.2）
+poly1305.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# 集成测试：reserve_range → bundle → 记录流的端到端对账（真实双锚文件事务）
+otp-allocator.workspace = true
+otp-anchor-spec.workspace = true
+otp-book.workspace = true
+# 集成测试：PAD_* 控制面走现有 AEAD 控制通道（序号空间与 OTP 数据分离的实证）
+otp-codec.workspace = true
+otp-session.workspace = true
+proptest.workspace = true

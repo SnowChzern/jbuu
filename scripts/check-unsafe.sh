@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-core_crates=(otp-allocator otp-recovery otp-session)
+core_crates=(otp-allocator otp-recovery otp-session otp-fullotp)
 other_crates=(otp-types otp-codec otp-book otp-anchor-spec otp-handshake
               otp-transport otp-terminal otp-testkit otp-cli)
 status=0
@@ -50,6 +50,8 @@ for c in "${other_crates[@]}"; do
 done
 
 if (( status == 0 )); then
+    # 核心加密材料 crate 新增说明：otp-fullotp（full-OTP 数据面：pad/bundle/
+    # 一次性 Poly1305 key，任务 #75）与 session 同级，一律禁止 unsafe。
     printf '[PASS] unsafe 检查：核心 crate（%s）forbid 且零 unsafe；其余业务 crate forbid\n' \
         "${core_crates[*]}"
 fi

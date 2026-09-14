@@ -450,6 +450,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "otp-fullotp"
+version = "0.1.1"
+dependencies = [
+ "otp-allocator",
+ "otp-anchor-spec",
+ "otp-book",
+ "otp-codec",
+ "otp-session",
+ "otp-types",
+ "poly1305",
+ "proptest",
+ "zeroize",
+]
+
+[[package]]
 name = "otp-handshake"
 version = "0.1.1"
 dependencies = [

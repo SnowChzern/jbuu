@@ -6,5 +6,6 @@
 #![forbid(unsafe_code)]
 
 pub use otp_book::allocator::{
-    Allocator, AllocatorConfig, CommittedSegment, IssueError, SegmentIssuer,
+    Allocator, AllocatorConfig, CommittedSegment, IssueError, RangeIssuer, ReservedRange,
+    SegmentIssuer,
 };

@@ -254,6 +254,8 @@ impl HandshakeError {
                 IssueError::LockUnavailable | IssueError::AnchorCorrupt | IssueError::Io => {
                     ErrorCode::IO_ERROR
                 }
+                // reserve_range 参数误用（本地 bug 面上：握手路径不调用范围预留）
+                IssueError::InvalidRange => ErrorCode::INTERNAL,
             },
             Self::Csprng => ErrorCode::CSPRNG_FAILURE,
         }

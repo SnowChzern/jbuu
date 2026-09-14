@@ -28,11 +28,15 @@ otp-terminal = { path = "crates/otp-terminal", version = "0.1.1" }
 otp-platform = { path = "crates/otp-platform", version = "0.1.1" }
 otp-cli = { path = "crates/otp-cli", version = "0.1.1" }
 otp-testkit = { path = "crates/otp-testkit", version = "0.1.1" }
+otp-fullotp = { path = "crates/otp-fullotp", version = "0.1.1" }
 
 # 系统调用（pread/fsync/文件锁/目录同步；业务层禁散落裸 unsafe，规划 §1.2）
 rustix = { version = "1.0", default-features = false, features = ["std", "fs"] }
 # AEAD：RustCrypto ChaCha20-Poly1305（仅会话层，不用于对段做任何派生）
 chacha20poly1305 = "0.10"
+# 一次性 Poly1305（full-OTP 数据面；独立 one-time key API，与上面的 AEAD
+# 构造无关；任务 #75）
+poly1305 = "0.8"
 # 随机数：OS CSPRNG；失败即终止握手
 getrandom = "0.3"
 # 敏感内存清零与受控暴露（derive 特性用于 ZeroizeOnDrop 派生）
