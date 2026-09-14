@@ -5,9 +5,9 @@
 //! - **同一 PTY 存活**：恢复连接附着旧句柄，shell 状态可读；
 //! - **并发恢复各得不同段 + 单主**：双客户端 barrier 竞争附着，恰一胜者
 //!   （另一 `LeaseHeldByOther`），随后断线接管 token 递增
-//!   （规划 §5 测试 10 全栈口径）；竞争者各持**独立客户端分配器**
-//!   （`Ends::racer_ends`，F6 修复：握手套件不在持跨连接共享锁状态下
-//!   做阻塞网络 I/O，见竞争测试处注释）；
+//!   （规划 §5 测试 10 全栈口径）；竞争夹具 F6/F6b 修复：竞争者各持
+//!   **独立客户端分配器**（握手不持跨连接共享锁做网络 I/O），holder
+//!   由专线程全程心跳维持活跃（"活跃期不得接管"不靠 LEASE 计时碰运气）；
 //! - **恢复 token 只能是索引/句柄**：句柄恒为注册表计数器（跨会话不变），
 //!   与段号推进无关联；
 //! - **明文不出传输层**：WireTap 旁录不含终端明文与段正文。
@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -140,7 +141,7 @@ fn tapped_pair() -> ((LoopbackTransport, LoopbackTransport), WireTap) {
 /// DEADLINE 破环 → 质量门概率性翻红（f74cad3 上 35 跑 5 红）。
 ///
 /// 独立分配器即真实产品拓扑：并发的第二条恢复连接只能来自另一个客户
-/// 端进程——各自持独立锚状态（同机同锚文件会在分配器 OFD 锁上
+/// 端进程——各自持独立锚状态（同机同锚文件会在分配器 OFD 非阻塞锁上
 /// fail-closed，不存在两进程共享同一内存分配器）。换独立分配器后，
 /// 客户端侧握手不再持任何跨连接共享锁；唯一跨网络 I/O 的共享锁只剩
 /// 服务端分配器——与产品 `serve_one` 同款（F7 观测，串行有界无环）。
@@ -319,6 +320,11 @@ fn serve_thread_join(h: std::thread::JoinHandle<ServeSummary>) -> ServeSummary {
 #[test]
 fn concurrent_recovery_races_single_master_and_distinct_segments() {
     let ends = make_ends("race");
+    // 竞争者端点栈预构建（F6）：book/锚落盘等磁盘工作移出竞争窗口，
+    // 窗口内只剩纯内存握手与 attach。
+    let racer_stacks: Vec<Ends> = (0..2)
+        .map(|n| racer_ends(&ends, &format!("race-r{n}")))
+        .collect();
     let mut taps = Vec::new();
 
     // holder 建立终端。
@@ -338,20 +344,46 @@ fn concurrent_recovery_races_single_master_and_distinct_segments() {
     collect_until(&mut ts1, "RACE_STATE=mk");
     ts1.ping().unwrap();
 
+    // holder 活跃心跳（F6b 复修，审计打回点）：竞争窗口内由专线程按
+    // 固定节拍无条件续期——产品客户端泵 F1 同语义（与输出活动解耦、
+    // 每 ping_interval 必发）。首版修复只消了 ABBA 死锁，但 holder 的
+    // 最后一次心跳停留在竞争开始前：负载拉长竞争窗口（双握手多轮
+    // 线程唤醒 + barrier）便超过 LEASE=5s，租约被判定过期，首个
+    // racer attach 即按"超时接管"被授予 → granted==1 概率翻红（审计
+    // 复测 5/50；本机 16 路 CPU 饱和负载下首跑即复现，见 evidence/
+    // task-58-r2/prefix-loaded-repro-run1-FAIL.log）。产品无损：真 holder 客户端泵
+    // 每秒无条件 ping，租约不会静默过期。让 holder 在竞争全程真活跃，
+    // "holder 活跃期间不得有任何接管"才是针对真活跃 holder 的检验
+    // （断言语义收紧而非放松）。线程不持任何共享锁（仅本连接发送），
+    // 不参与任何锁序，无新增互等面。
+    let holder_stop = Arc::new(AtomicBool::new(false));
+    let holder_pump = {
+        let stop = Arc::clone(&holder_stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if ts1.ping().is_err() {
+                    break; // 连接已断，无需继续维持
+                }
+                std::thread::sleep(Duration::from_millis(250)); // LEASE/20
+            }
+            ts1.close();
+        })
+    };
+
     // 两个恢复连接：各自**先完成新握手（各签发不同段）**，再 barrier
     // 同放竞争 lease（附着时单主仲裁）。
     //
-    // F6 修复：竞争者各持独立客户端分配器（旧夹具两线程共享
-    // `client_alloc` 锁跨阻塞握手 → 与服务端 `server_alloc` 成 ABBA
-    // 四边互等环，详见 `racer_ends` 注释）。竞争断言语义不变：
-    // 恰一主/段号互异/fencing 全部原样。
+    // F6 修复：竞争者各持独立客户端分配器（`racer_ends` 预构建），
+    // 握手套件不持跨连接共享锁做阻塞网络 I/O（旧夹具两线程共享
+    // `client_alloc` 锁跨整个握手，与共享 `server_alloc` 交叉成 ABBA
+    // 四边互等环，30s DEADLINE 破环，详见 `racer_ends` 注释）。竞争
+    // 断言语义不变：恰一主/段号互异/fencing 全部原样。
     let barrier = Arc::new(Barrier::new(2));
     let mut racers = Vec::new();
-    for n in 0..2 {
+    for ends2 in racer_stacks {
         let ((c, s), tap) = tapped_pair();
         taps.push(tap);
         let server = serve_thread(&ends, s);
-        let ends2 = racer_ends(&ends, &format!("race-r{n}"));
         let barrier2 = Arc::clone(&barrier);
         racers.push(std::thread::spawn(move || {
             // 握手先行（新段签发与竞争无关：恢复必先重新仲裁）。
@@ -402,7 +434,9 @@ fn concurrent_recovery_races_single_master_and_distinct_segments() {
     assert_eq!(segments, vec![0, 1, 2]);
 
     // holder 断线 → 重试接管：token 递增 + 同一 PTY。
-    ts1.close();
+    // （停止心跳线程：线程收尾 close ts1 → 服务端 PeerClosed → 租约放弃）
+    holder_stop.store(true, Ordering::Release);
+    holder_pump.join().expect("holder 心跳线程汇合");
     assert_eq!(serve_thread_join(server1).end, ServeEnd::PeerClosed);
     let ((c4, s4), tap4) = tapped_pair();
     taps.push(tap4);
