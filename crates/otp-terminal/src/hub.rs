@@ -15,10 +15,27 @@
 //! 读写边界：一切写（Input/Resize）都经 fencing 写门（单主执行点）；
 //! 读（drain output）无副作用，由当前 holder 连接线程独占执行，
 //! 被接管后下一循环即被 token 检查逐出。
+//!
+//! ## 写入分片与回显排空（任务 #56 F2 返工）
+//!
+//! ECHO 开启时 master 写入的每个字节都被回显到 master 读队列，而读侧
+//! 与写侧是**同一个连接线程**：单次大块写会塞满回显队列 → 写侧阻塞、
+//! 读侧永远排不了空（互锁）。因此服务端泵按 [`PTY_WRITE_SLICE`] 分片
+//! 写入，并在片间排空 master 输出（见 `server.rs`）；底层 master fd 恒
+//! 非阻塞 + 写预算（见 `otp-platform::pty`）保证 fail closed。
+//!
+//! ## PTY 子进程的收割锚点（任务 #56 F4 返工）
+//!
+//! PTY 子进程在专用长寿命 spawn 线程上派生（`PR_SET_PDEATHSIG(SIGKILL)`
+//! 的投递锚点 = 该线程）：连接线程退出（detach/断线）**不会**误杀
+//! shell（恢复语义不变）；serve 进程死亡（含 SIGKILL 硬杀）时 spawn
+//! 线程一并消亡，内核向全部 PTY 子进程投递 SIGKILL——不残留 pts
+//! 孤儿（交互式 shell 忽略 SIGTERM，故用 SIGKILL；见 otp-platform
+//! pty 模块文档）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use otp_platform::pty::{PtyMaster, PtyRead, PtyWinsize};
@@ -27,7 +44,14 @@ use super::lease::{ConnId, FencingToken, LeaseDenied, LeaseGrant, LeaseManager};
 use super::{ExitStatus, TerminalError, TerminalHandle, WindowSize};
 
 /// master 写预算（fencing 写门内执行；超时即 fail closed 关闭该连接）。
+/// master fd 恒非阻塞（otp-platform pty 阻塞纪律）：预算对每一次内核
+/// 进入都生效——写路径**有界**，绝不无限阻塞（任务 #56 F2）。
 const MASTER_WRITE_BUDGET: Duration = Duration::from_secs(5);
+
+/// 单次写 master 的分片上限（字节）。ECHO 开启时分片的回显量远小于
+/// master 读队列容量，服务端泵在片间排空回显——写读互锁从根上不发生
+/// （任务 #56 F2：单线程泵的根治方案，配合 master fd 非阻塞）。
+pub const PTY_WRITE_SLICE: usize = 2048;
 
 struct PtySlot {
     master: PtyMaster,
@@ -45,21 +69,36 @@ pub struct PtyHub {
 }
 
 impl PtyHub {
-    /// spawn shell 于新 PTY。
+    /// spawn shell 于新 PTY（在调用方线程上直接派生）。
+    ///
+    /// 生产路径应优先 [`TerminalRegistry::open`]（经专用 spawn 线程派生
+    /// ——PDEATHSIG 锚点是长寿命线程，detach/断线不误杀 shell）；本构
+    /// 造器供测试与无 registry 场景使用。
     pub fn spawn(
         handle: TerminalHandle,
         shell: Vec<String>,
         window: WindowSize,
         lease_timeout: Duration,
     ) -> Result<Self, TerminalError> {
-        let ws = PtyWinsize {
-            rows: window.rows,
-            cols: window.cols,
-        };
-        let master = PtyMaster::open(ws).map_err(|_| TerminalError::Io)?;
-        let child =
-            otp_platform::pty::spawn_on_pty(&master, &shell, ws).map_err(|_| TerminalError::Io)?;
-        Ok(Self {
+        let (master, child) = spawn_pty_pair(&shell, window)?;
+        Ok(Self::from_parts(
+            handle,
+            shell,
+            master,
+            child,
+            lease_timeout,
+        ))
+    }
+
+    /// 以既有 master/子进程构造（spawn 线程派生后的装配点）。
+    fn from_parts(
+        handle: TerminalHandle,
+        shell: Vec<String>,
+        master: PtyMaster,
+        child: std::process::Child,
+        lease_timeout: Duration,
+    ) -> Self {
+        Self {
             handle,
             shell,
             lease: Arc::new(LeaseManager::new(lease_timeout)),
@@ -68,7 +107,7 @@ impl PtyHub {
                 child,
                 exit: None,
             }),
-        })
+        }
     }
 
     /// 本终端恢复句柄（索引/句柄，非段材料）。
@@ -106,7 +145,11 @@ impl PtyHub {
     }
 
     /// 终端输入：**fencing 写门内**写 master（单主执行点；陈旧 writer
-    /// 一律拒绝，绝不与新 holder 的写交错）。
+    /// 一律拒绝，绝不与新 holder 的写交错）。写路径有界（master fd 非
+    /// 阻塞 + 预算，任务 #56 F2）：持锁时间上限即预算。
+    ///
+    /// 调用方（服务端泵）应按 [`PTY_WRITE_SLICE`] 分片调用并在片间排空
+    /// master 输出（ECHO 回显不能由本线程写完再读——见模块文档）。
     pub fn write_input(&self, token: FencingToken, data: &[u8]) -> Result<(), TerminalError> {
         self.lease.with_write_gate(token, || {
             let slot = self.pty.lock().unwrap_or_else(|p| p.into_inner());
@@ -182,6 +225,9 @@ fn signal_of(status: &std::process::ExitStatus) -> i32 {
 }
 
 /// 终端注册表：句柄 → PTY 枢纽；新终端/恢复句柄的唯一事实源。
+///
+/// PTY 子进程经内部**专用长寿命 spawn 线程**派生（F4：PDEATHSIG 锚点
+/// = spawn 线程——连接线程退出不误杀 shell，进程死亡则全部收割）。
 pub struct TerminalRegistry {
     shell: Vec<String>,
     lease_timeout: Duration,
@@ -192,10 +238,59 @@ pub struct TerminalRegistry {
 struct RegInner {
     next_handle: u64,
     hubs: HashMap<u64, Arc<PtyHub>>,
+    /// 专用 spawn 线程的投递端（懒创建；随 registry Drop 关闭 → 线程
+    /// 退出 → PDEATHSIG 收割残余 shell）。None = 线程不可用（创建失败
+    /// 或已死亡：open 时重试创建，仍失败则 fail closed）。
+    spawner: Option<mpsc::Sender<SpawnJob>>,
+}
+
+/// spawn 线程作业：在该线程上完成 PTY 派生（PDEATHSIG 锚点）。
+struct SpawnJob {
+    shell: Vec<String>,
+    ws: PtyWinsize,
+    reply: mpsc::Sender<Result<(PtyMaster, std::process::Child), TerminalError>>,
+}
+
+fn spawn_pty_pair(
+    shell: &[String],
+    window: WindowSize,
+) -> Result<(PtyMaster, std::process::Child), TerminalError> {
+    let ws = PtyWinsize {
+        rows: window.rows,
+        cols: window.cols,
+    };
+    let master = PtyMaster::open(ws).map_err(|_| TerminalError::Io)?;
+    let child =
+        otp_platform::pty::spawn_on_pty(&master, shell, ws).map_err(|_| TerminalError::Io)?;
+    Ok((master, child))
+}
+
+/// 起一个 PTY spawn 线程（返回投递端）。线程存活至投递端全部 Drop。
+fn spawn_thread() -> Option<mpsc::Sender<SpawnJob>> {
+    let (tx, rx) = mpsc::channel::<SpawnJob>();
+    std::thread::Builder::new()
+        .name("otp-term-pty-spawn".into())
+        .spawn(move || {
+            // 串行处理派生作业；无分配、无跨作业状态。
+            for job in rx {
+                let res = PtyMaster::open(job.ws)
+                    .map_err(|_| TerminalError::Io)
+                    .and_then(|m| {
+                        otp_platform::pty::spawn_on_pty(&m, &job.shell, job.ws)
+                            .map(|child| (m, child))
+                            .map_err(|_| TerminalError::Io)
+                    });
+                // 回信端已放弃（registry 撤单）则丢弃结果：master Drop
+                // 关闭 → 子进程收 SIGHUP/EIO 退出，不残留。
+                let _ = job.reply.send(res);
+            }
+        })
+        .ok()
+        .map(|_| tx)
 }
 
 impl TerminalRegistry {
-    /// 以默认 shell 命令行与 lease 超时构造。
+    /// 以默认 shell 命令行与 lease 超时构造（spawn 线程懒创建）。
     pub fn new(shell: Vec<String>, lease_timeout: Duration) -> Self {
         Self {
             shell,
@@ -204,6 +299,7 @@ impl TerminalRegistry {
             inner: Mutex::new(RegInner {
                 next_handle: 1,
                 hubs: HashMap::new(),
+                spawner: None,
             }),
         }
     }
@@ -213,7 +309,45 @@ impl TerminalRegistry {
         self.conn_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// 创建新终端（spawn PTY + 登记句柄）。
+    /// 经专用 spawn 线程派生 PTY（F4：PDEATHSIG 锚点 = 长寿命线程）。
+    /// 线程不可用时重试创建一次，仍不可用则 fail closed（Io）。
+    fn spawn_via_worker(
+        &self,
+        reg: &mut RegInner,
+        window: WindowSize,
+    ) -> Result<(PtyMaster, std::process::Child), TerminalError> {
+        if reg.spawner.is_none() {
+            reg.spawner = spawn_thread();
+        }
+        let Some(tx) = reg.spawner.clone() else {
+            return Err(TerminalError::Io);
+        };
+        let (rtx, rrx) = mpsc::channel();
+        if tx
+            .send(SpawnJob {
+                shell: self.shell.clone(),
+                ws: PtyWinsize {
+                    rows: window.rows,
+                    cols: window.cols,
+                },
+                reply: rtx,
+            })
+            .is_err()
+        {
+            reg.spawner = None;
+            return Err(TerminalError::Io);
+        }
+        match rrx.recv() {
+            Ok(res) => res,
+            Err(_) => {
+                // spawn 线程已死（作业未交付）：标记失效，fail closed。
+                reg.spawner = None;
+                Err(TerminalError::Io)
+            }
+        }
+    }
+
+    /// 创建新终端（spawn PTY + 登记句柄；初始窗口在派生时点生效）。
     pub fn open(&self, window: WindowSize) -> Result<Arc<PtyHub>, TerminalError> {
         let mut reg = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let handle = reg.next_handle;
@@ -221,12 +355,14 @@ impl TerminalRegistry {
             .next_handle
             .checked_add(1)
             .expect("句柄计数器溢出（2^64 终端）");
-        let hub = Arc::new(PtyHub::spawn(
+        let (master, child) = self.spawn_via_worker(&mut reg, window)?;
+        let hub = Arc::new(PtyHub::from_parts(
             TerminalHandle(handle),
             self.shell.clone(),
-            window,
+            master,
+            child,
             self.lease_timeout,
-        )?);
+        ));
         reg.hubs.insert(handle, Arc::clone(&hub));
         Ok(hub)
     }

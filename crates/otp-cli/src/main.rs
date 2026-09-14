@@ -42,6 +42,13 @@ const EXIT_POLICY_REFUSED: i32 = 2;
 const DEFAULT_DEADLINE_SECS: u64 = 120;
 /// 默认 PTY 单主 lease 超时（毫秒）。
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 15_000;
+/// connect 客户端心跳周期（固定值，任务 #56 F1 返工）。
+///
+/// 协议无 lease 协商通道——客户端无法得知服务端 `--lease-timeout-ms`，
+/// 不能假设默认 lease/3：固定 1s 无条件心跳（与输出活动解耦，见
+/// `otp-terminal` 泵文档）覆盖任意 ≥2s 的服务端 lease 配置；开销为
+/// 每秒一个微小加密帧，可忽略。
+const CONNECT_PING_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -83,7 +90,7 @@ enum Cmd {
         /// PTY shell 可执行文件（缺省 $SHELL，再退 /bin/sh）。
         #[arg(long)]
         shell: Option<String>,
-        /// PTY 单主 lease 超时（毫秒；客户端按 1/3 周期心跳）。
+        /// PTY 单主 lease 超时（毫秒；客户端固定 1s 心跳，配置应 ≥2000）。
         #[arg(long, default_value_t = DEFAULT_LEASE_TIMEOUT_MS)]
         lease_timeout_ms: u64,
         /// 显式接受未证明加密的 swap（把 BLOCK 降级为 warn；仅限受控环境）。
@@ -724,10 +731,7 @@ fn run_connect(args: ConnectArgs) -> Result<(), CliError> {
             client.token(),
             info.segment.get()
         ));
-        let ping = otp_terminal::TerminalConfig {
-            lease_timeout: Duration::from_secs(DEFAULT_LEASE_TIMEOUT_MS / 1000),
-        }
-        .ping_interval();
+        let ping = CONNECT_PING_INTERVAL;
         // Stdin 句柄本身 Send+'static（内部逐次加锁）；读取线程随
         // run_interactive 移交所有权（远端退出后不阻塞等待 stdin EOF）。
         let input = std::io::stdin();

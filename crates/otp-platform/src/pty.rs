@@ -20,6 +20,28 @@
 //! - 客户端原始模式：[`RawMode`]（tcgetattr/cfmakeraw/tcsetattr，
 //!   Drop 恢复；非 tty 输入返回 None，测试管道路径不失效）。
 //!
+//! ## 阻塞纪律（任务 #56 F2 返工）
+//!
+//! master fd 一律 `O_NONBLOCK`：ECHO 开启时，写入 master 的每个字节
+//! 都被行规程回显到 master 读队列，若读侧（服务端连接泵——与写侧
+//! 同一线程）不排空，**阻塞 fd 上的 `write(ptmx)` 会在内核内无限期
+//! 睡眠**，任何用户态写预算都对已进入内核的 write 无效。非阻塞 fd +
+//! poll(POLLOUT) 预算循环使预算真正生效（EAGAIN 即回 poll，超时即
+//! [`PlatformError::Io`]——fail closed）。调用方（服务端泵）另按小
+//! 分片写入并在片间排空回显（`otp-terminal` 的 `PTY_WRITE_SLICE`）。
+//!
+//! ## 子进程收割（任务 #56 F4 返工）
+//!
+//! `spawn_on_pty` 在子进程内设置 `PR_SET_PDEATHSIG(SIGKILL)`：父
+//! （serve）被 SIGKILL 硬杀后内核代为投递 SIGKILL，PTY shell 不残留
+//! 为 ppid=1 的 pts 孤儿。用 SIGKILL 而非 SIGTERM 的原因：PTY shell
+//! 以 tty 为 stdio → **交互式 shell 按惯例忽略 SIGTERM**（实测
+//! dash），只有不可捕获/不可忽略的 SIGKILL 保证收割。注意 PDEATHSIG
+//! 的投递锚点是**创建该子进程的线程**——因此业务侧
+//! （`TerminalRegistry`）经专用长寿命 spawn 线程派生 PTY 子进程，连接
+//! 线程退出（detach/断线）不会误杀 shell；正常退出路径的语义不变
+//! （hub Drop 仍 kill+reap，退出码 128+9 与显式 kill 一致）。
+//!
 //! 本模块不做任何协议/密钥语义，也不记录任何数据内容（日志面仅
 //! 元数据：字节数/行数/错误类别）。
 
@@ -78,6 +100,21 @@ impl PtyMaster {
             libc::grantpt(master.as_raw_fd());
             libc::unlockpt(master.as_raw_fd());
         }
+        // master 恒非阻塞（模块级阻塞纪律）：阻塞 write(ptmx) 在回显
+        // 队列满时会无限期睡眠于内核，任何用户态预算都救不回来。
+        // SAFETY: fcntl 为纯 fd 标志读 syscall；fd 有效。
+        #[allow(unsafe_code)]
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(PlatformError::Io);
+        }
+        // SAFETY: F_SETFL 仅修改标志位，失败即返回负值。
+        #[allow(unsafe_code)]
+        let rc =
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(PlatformError::Io);
+        }
         let pty = Self { fd: master };
         if winsize.rows > 0 && winsize.cols > 0 {
             pty.set_winsize(winsize)?;
@@ -90,6 +127,11 @@ impl PtyMaster {
     /// 语义：预算内必须写完全部数据，否则 [`PlatformError::Io`]（调用方
     /// fail closed 关闭连接）——绝不无限阻塞（PTY 输入队列满且对端
     /// 长期不读时，master 写会无限阻塞）。
+    ///
+    /// master fd 恒为 `O_NONBLOCK`（见 [`PtyMaster::open`]，任务 #56 F2
+    /// 返工）：`write` 返回 `EAGAIN` 时回到 poll 循环继续等预算内的可
+    /// 写窗口——预算对每一次内核进入都生效（阻塞 fd 的 write 一旦进入
+    /// 内核睡眠，本函数的预算无从生效）。
     pub fn write_all_bounded(
         &self,
         mut data: &[u8],
@@ -120,7 +162,11 @@ impl PtyMaster {
             if rc == 0 {
                 return Err(PlatformError::Io); // 预算耗尽
             }
-            // SAFETY: fd 有效，buf 指针/长度取自存活切片，write 同步完成。
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(PlatformError::Io);
+            }
+            // SAFETY: fd 有效，buf 指针/长度取自存活切片，write 同步完成；
+            // O_NONBLOCK 下队列满返回 EAGAIN（回 poll 循环，预算继续消耗）。
             #[allow(unsafe_code)]
             let n = unsafe {
                 libc::write(
@@ -131,10 +177,12 @@ impl PtyMaster {
             };
             if n < 0 {
                 let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                match err.raw_os_error() {
+                    // 非阻塞饱和：回到 poll 等待可写窗口（预算内）。
+                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => continue,
+                    Some(code) if code == libc::EINTR => continue,
+                    _ => return Err(PlatformError::Io),
                 }
-                return Err(PlatformError::Io);
             }
             if n == 0 {
                 return Err(PlatformError::WriteZero);
@@ -165,10 +213,33 @@ impl PtyMaster {
         CString::new(buf).map_err(|_| PlatformError::InvalidData)
     }
 
-    /// 完整写（短写循环 + EINTR 重试）。master 写入即成为 slave 侧输入。
+    /// 完整写（阻塞语义：poll 等待可写 + 短写循环；无预算上限）。
+    /// master 写入即成为 slave 侧输入。基于非阻塞 fd + poll 实现（模块
+    /// 级阻塞纪律）：`EAGAIN` 表示回显/输入队列暂满，等待对端消费后继
+    /// 续。服务端数据面必须使用 [`PtyMaster::write_all_bounded`]；本方
+    /// 法保留给测试与无预算场景。
     pub fn write_all(&self, mut data: &[u8]) -> Result<(), PlatformError> {
         while !data.is_empty() {
-            // SAFETY: fd 有效，buf 指针/长度取自存活切片，write 同步完成。
+            let mut pfd = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: pfd 指向单个已初始化 pollfd；poll 同步返回，不保留指针。
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(PlatformError::Io);
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(PlatformError::Io);
+            }
+            // SAFETY: fd 有效，buf 指针/长度取自存活切片，write 同步完成；
+            // O_NONBLOCK 下饱和返回 EAGAIN（回 poll 继续等）。
             #[allow(unsafe_code)]
             let n = unsafe {
                 libc::write(
@@ -179,10 +250,11 @@ impl PtyMaster {
             };
             if n < 0 {
                 let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                match err.raw_os_error() {
+                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => continue,
+                    Some(code) if code == libc::EINTR => continue,
+                    _ => return Err(PlatformError::Io),
                 }
-                return Err(PlatformError::Io);
             }
             if n == 0 {
                 return Err(PlatformError::WriteZero);
@@ -301,10 +373,14 @@ impl io::Write for &PtyMaster {
 }
 
 /// 在既有 master 上派生子进程：slave 为 stdio 三端，`setsid` + `TIOCSCTTY`
-/// 使其成为新会话首领并取得控制终端（真实作业控制）。
+/// 使其成为新会话首领并取得控制终端（真实作业控制）；子进程内设置
+/// `PR_SET_PDEATHSIG(SIGKILL)`——serve 被硬杀后内核代杀 PTY shell，
+/// 不残留 pts 孤儿（任务 #56 F4；交互式 shell 忽略 SIGTERM，故用
+/// SIGKILL；见模块文档）。
 ///
-/// 安全边界：`pre_exec` 回调运行于 fork 后的子进程，只包含两个
-/// async-signal-safe syscall（setsid、ioctl），无分配/无锁/无 std 依赖。
+/// 安全边界：`pre_exec` 回调运行于 fork 后的子进程，只包含四个
+/// async-signal-safe syscall（setsid、ioctl、prctl、getppid），
+/// 无分配/无锁/无 std 依赖。
 pub fn spawn_on_pty(
     master: &PtyMaster,
     argv: &[String],
@@ -337,8 +413,12 @@ pub fn spawn_on_pty(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    // SAFETY: 回调体仅两次 syscall（见函数文档）；fd 0 在 pre_exec 阶段
-    // 已由 std 完成 dup2（slave），ioctl 目标有效。
+    // PDEATHSIG 锚点：捕获派生时点的父进程 pid（竞争闭合用，见下）。
+    // SAFETY: getpid 为纯 syscall，无副作用。
+    #[allow(unsafe_code)]
+    let parent_pid = unsafe { libc::getpid() };
+    // SAFETY: 回调体仅四次纯 syscall（见函数文档与各点注释）；fd 0 在
+    // pre_exec 阶段已由 std 完成 dup2（slave），ioctl 目标有效。
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -353,6 +433,31 @@ pub fn spawn_on_pty(
             let rc = libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0u64);
             if rc < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // PDEATHSIG（任务 #56 F4）：父进程（serve）死亡——包括无法
+            // 拦截的 SIGKILL——时内核向本进程投递 SIGKILL，PTY shell
+            // 不残留为 ppid=1 的 pts 孤儿。信号选 SIGKILL：PTY shell 以
+            // tty 为 stdio → 交互式 shell 按惯例忽略 SIGTERM（实测
+            // dash），只有 SIGKILL 保证收割。业务侧保证派生发生在长寿命
+            // spawn 线程（连接线程退出/detach 不触发投递）。
+            // SAFETY（子进程内）：prctl 为纯 syscall（int 返回）。
+            #[allow(unsafe_code)]
+            let rc = libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // 竞争闭合：若 prctl 生效前父进程已死，信号永不投递（投递
+            // 点已错过）——以 getppid 变化检测，放弃 exec 直接退出。
+            // SAFETY（子进程内）：getppid 为纯 syscall。
+            #[allow(unsafe_code)]
+            if libc::getppid() != parent_pid {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
             }
             Ok(())
         });

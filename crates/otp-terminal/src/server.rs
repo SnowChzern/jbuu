@@ -29,7 +29,7 @@ use otp_session::{MessageType, Session};
 use otp_transport::{FramedStream, TransportError};
 
 use super::frame::{TerminalFrame, chunk_input};
-use super::hub::TerminalRegistry;
+use super::hub::{PTY_WRITE_SLICE, PtyHub, TerminalRegistry};
 use super::lease::{ConnId, FencingToken, LeaseDenied};
 use super::{ExitStatus, TerminalError, TerminalHandle, WindowSize};
 
@@ -185,6 +185,57 @@ fn send_terminal_frame(
     io.send_frame(&wire).map_err(TerminalError::Transport)
 }
 
+/// 非阻塞排空 master 输出并转发（Output 帧分块）。
+///
+/// 写入分片之间也调用本函数（F2 返工）：ECHO 开启时 master 写入的
+/// 字节被回显到 master 读队列，而读侧正是本连接线程——若不在片间
+/// 排空，回显队列塞满后写侧只能在预算内等（旧实现则在阻塞 write
+/// 中永久楔死）。每片 ≤ [`PTY_WRITE_SLICE`]，片间排空 → 写读互锁
+/// 从根上不发生。
+fn drain_pty<T: FramedStream>(
+    hub: &PtyHub,
+    io: &mut T,
+    session: &mut Session,
+    out_buf: &mut [u8],
+    pending: &mut Vec<u8>,
+    pty_eof: &mut bool,
+    output_bytes: &mut u64,
+) -> Result<(), TerminalError> {
+    if *pty_eof {
+        return Ok(());
+    }
+    loop {
+        match hub.drain_output(out_buf) {
+            Ok(otp_platform::pty::PtyRead::Data(n)) => {
+                pending.extend_from_slice(&out_buf[..n]);
+                if pending.len() >= super::frame::DATA_CHUNK_MAX {
+                    break;
+                }
+            }
+            Ok(otp_platform::pty::PtyRead::Eof) => {
+                *pty_eof = true;
+                break;
+            }
+            Ok(otp_platform::pty::PtyRead::Timeout) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    if !pending.is_empty() {
+        for chunk in chunk_input(pending) {
+            send_terminal_frame(
+                io,
+                session,
+                &TerminalFrame::Output {
+                    data: chunk.to_vec(),
+                },
+            )?;
+            *output_bytes = output_bytes.saturating_add(chunk.len() as u64);
+        }
+        pending.clear();
+    }
+    Ok(())
+}
+
 fn drive<T: FramedStream>(
     registry: &TerminalRegistry,
     io: &mut T,
@@ -291,19 +342,35 @@ fn drive<T: FramedStream>(
                 match f {
                     TerminalFrame::Input { data } => {
                         if fresh {
-                            for chunk in chunk_input(&data) {
-                                match hub.write_input(token, chunk) {
-                                    Ok(()) => {
-                                        input_bytes =
-                                            input_bytes.saturating_add(chunk.len() as u64);
+                            // F2 返工：≤PTY_WRITE_SLICE 分片写 + 片间排空回显
+                            //（单线程泵写读互锁的根治；底层写另有非阻塞+预算）。
+                            'input: for chunk in chunk_input(&data) {
+                                for slice in chunk.chunks(PTY_WRITE_SLICE) {
+                                    match hub.write_input(token, slice) {
+                                        Ok(()) => {
+                                            input_bytes =
+                                                input_bytes.saturating_add(slice.len() as u64);
+                                        }
+                                        Err(TerminalError::StaleWriter) => {
+                                            end = Some(ServeEnd::Fenced);
+                                            break 'input;
+                                        }
+                                        Err(e) => {
+                                            end = Some(ServeEnd::Failed(e));
+                                            break 'input;
+                                        }
                                     }
-                                    Err(TerminalError::StaleWriter) => {
-                                        end = Some(ServeEnd::Fenced);
-                                        break;
-                                    }
-                                    Err(e) => {
+                                    if let Err(e) = drain_pty(
+                                        &hub,
+                                        io,
+                                        session,
+                                        &mut out_buf,
+                                        &mut pending,
+                                        &mut pty_eof,
+                                        &mut output_bytes,
+                                    ) {
                                         end = Some(ServeEnd::Failed(e));
-                                        break;
+                                        break 'input;
                                     }
                                 }
                             }
@@ -350,40 +417,18 @@ fn drive<T: FramedStream>(
             }
         }
 
-        // PTY：非阻塞排空输出。
-        if !pty_eof {
-            loop {
-                match hub.drain_output(&mut out_buf) {
-                    Ok(otp_platform::pty::PtyRead::Data(n)) => {
-                        pending.extend_from_slice(&out_buf[..n]);
-                        if pending.len() >= super::frame::DATA_CHUNK_MAX {
-                            break;
-                        }
-                    }
-                    Ok(otp_platform::pty::PtyRead::Eof) => {
-                        pty_eof = true;
-                        break;
-                    }
-                    Ok(otp_platform::pty::PtyRead::Timeout) => break,
-                    Err(e) => {
-                        end = Some(ServeEnd::Failed(e));
-                        break;
-                    }
-                }
-            }
-            if !pending.is_empty() {
-                for chunk in chunk_input(&pending) {
-                    send_terminal_frame(
-                        io,
-                        session,
-                        &TerminalFrame::Output {
-                            data: chunk.to_vec(),
-                        },
-                    )?;
-                    output_bytes = output_bytes.saturating_add(chunk.len() as u64);
-                }
-                pending.clear();
-            }
+        // PTY：非阻塞排空输出（输入分片间也调用，见 drain_pty）。
+        if let Err(e) = drain_pty(
+            &hub,
+            io,
+            session,
+            &mut out_buf,
+            &mut pending,
+            &mut pty_eof,
+            &mut output_bytes,
+        ) {
+            end = Some(ServeEnd::Failed(e));
+            break;
         }
 
         // 退出路径：排空后回传退出码，短暂收尾即终止。

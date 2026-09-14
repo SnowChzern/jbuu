@@ -89,9 +89,14 @@ pub struct ExitStatus {
 }
 
 /// 终端配置（lease/心跳时序）。
+///
+/// 注意（任务 #56 F1 返工）：协议不携带 lease 协商——客户端**无法得知**
+/// 服务端实际配置的 lease 超时。`ping_interval`（lease/3）仅适用于
+/// 调用方确知对端 lease 的场合；否则应采用固定的保守心跳（CLI 采用
+/// 1s），且心跳发送不得与输出活动耦合（见 `client` 泵文档）。
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalConfig {
-    /// PTY 单主 lease 超时（客户端须按约 1/3 周期发心跳）。
+    /// PTY 单主 lease 超时（确知对端配置时用于推导心跳周期）。
     pub lease_timeout: Duration,
 }
 

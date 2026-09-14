@@ -277,12 +277,15 @@ impl<T: FramedStream> TerminalSession<T> {
         }
     }
 
-    /// 交互式泵（stdin → Input 帧；Output 帧 → stdout；空闲发 Ping）。
+    /// 交互式泵（stdin → Input 帧；Output 帧 → stdout；按 ping_interval
+    /// 无条件发 Ping）。
     ///
-    /// 单主/活性语义：租约由服务端按心跳维护——空闲时按
-    /// `ping_interval` 发 Ping；`window_probe` 每轮探测本地窗口变化
-    /// （SIGWINCH 的轮询近似）。输入读取走 scoped thread（借用即可，
-    /// 调用方无需 'static）。
+    /// 单主/活性语义：租约由服务端按心跳维护——**每个 ping_interval 必发
+    /// 一次 Ping，与输出/输入活动完全解耦**（任务 #56 F1 返工：旧实现仅
+    /// 在空闲轮询时 Ping，纯输出长流期间（tail -f/构建日志）输出事件
+    /// 不断重置计时器 → 心跳永不到期 → lease 超时被中途逐出）。
+    /// `window_probe` 每轮探测本地窗口变化（SIGWINCH 的轮询近似）。
+    /// 输入读取走 scoped thread（借用即可，调用方无需 'static）。
     pub fn run_interactive(
         mut self,
         input: impl Read + Send + 'static,
@@ -349,6 +352,20 @@ impl<T: FramedStream> TerminalSession<T> {
                     break Ok(ExitStatus { code: 0 }); // detach（终端存活）
                 }
             }
+            // 心跳：按 ping_interval **无条件**续期（F1 返工：与输出/输入
+            // 活动解耦——纯输出长流期间也必须保持活性；即便本轮正在
+            // 连续收发，间隔一到就发）。
+            if last_ping.elapsed() >= ping_interval {
+                // 心跳不继承 poll_event 的短 deadline（背压下仍留出充足
+                // 发送预算，避免误杀会话）。
+                self.io
+                    .set_deadline(Duration::from_secs(2))
+                    .map_err(TerminalError::Transport)?;
+                if let Err(e) = self.ping() {
+                    break Err(e);
+                }
+                *last_ping = Instant::now();
+            }
             // 输入侧：非阻塞取 stdin 块。
             match rx.try_recv() {
                 Ok(Some(chunk)) => {
@@ -383,17 +400,10 @@ impl<T: FramedStream> TerminalSession<T> {
                         break Err(TerminalError::Io);
                     }
                     let _ = output.flush();
-                    *last_ping = Instant::now();
+                    // 注意：输出活动**不**重置心跳计时器（F1：解耦）。
                 }
                 Ok(Some(TerminalEvent::Exit(code))) => break Ok(ExitStatus { code }),
-                Ok(None) => {
-                    if last_ping.elapsed() >= ping_interval {
-                        if let Err(e) = self.ping() {
-                            break Err(e);
-                        }
-                        *last_ping = Instant::now();
-                    }
-                }
+                Ok(None) => {}
                 Err(e) => break Err(e),
             }
         }
