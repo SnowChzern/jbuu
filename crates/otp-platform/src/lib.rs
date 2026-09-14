@@ -57,10 +57,15 @@ impl LeaseGuard {
 
 /// Require a local filesystem whose lock and fsync semantics are accepted.
 pub fn require_supported_filesystem(path: &Path) -> Result<(), PlatformError> {
+    // 相对路径（无目录部分，如 "a.anchor"）时 parent 为空串——回退当前
+    // 目录，否则 statfs("") 必然 ENOENT 而误报"探测失败"（任务 #66 冒烟
+    // 实跑发现；与 otp-book::generate::fsync_parent_dir 同口径）。
     let probe = if path.exists() {
         path
     } else {
-        path.parent().unwrap_or(Path::new("."))
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
     };
     let magic = statfs_magic(probe)?;
     // ext2/3/4, XFS and btrfs. Network, userspace, overlay and volatile
@@ -484,6 +489,22 @@ impl PlatformError {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn relative_path_probe_falls_back_to_cwd() {
+        // 回归（任务 #66）：无目录部分的相对路径（锚初始化典型用法）
+        // parent 为空串，回退前 statfs("") 必 ENOENT 而误报探测失败。
+        // 断言口径：不再出现“探测失败”类 I/O 错误（白名单判定本身
+        // 依赖构建盘文件系统，只排除 Io/InvalidData）。
+        match require_supported_filesystem(Path::new("no-such-anchor-rel-probe.anchor")) {
+            Ok(()) => {}
+            Err(PlatformError::UnsupportedFilesystem { .. }) => {
+                // 构建盘不在白名单（如 tmpfs）时允许拒绝——但必须是
+                // 明确的文件系统判定，而非探测失败。
+            }
+            other => panic!("相对路径探测不应失败：{other:?}"),
+        }
+    }
 
     #[test]
     fn short_writes_are_completed_and_faults_surface() {

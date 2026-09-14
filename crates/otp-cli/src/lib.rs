@@ -6,6 +6,8 @@
 //!   otp-allocator 的**端到端加密会话驱动**（服务端回显口径 = WP-12 M1
 //!   口径，PTY 终端形态归 WP-16）；
 //! - [`anchorio`]：锚 inspect（§65：只读、仅公开元数据）；
+//! - [`anchorinit`]：锚 init 写路径（wp02 §2.5：首启初始化，O_EXCL/
+//!   0600/fsync；仅公开元数据的 Init 记录，无段材料）；
 //! - [`auditlog`]：结构化白名单审计日志（§94）的条目构造助手——只暴露
 //!   五个白名单字段的填充函数，自由格式在类型层即无通道；
 //! - [`doctor`]：doctor 报告的采集/覆盖/渲染（§151），高风险 → 拒绝启动。
@@ -15,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anchorinit;
 pub mod anchorio;
 pub mod auditlog;
 pub mod doctor;

@@ -22,6 +22,7 @@ otp-book.workspace = true
 otp-platform.workspace = true
 otp-codec.workspace = true
 otp-anchor-spec.workspace = true
+rustix.workspace = true
 otp-allocator.workspace = true
 otp-handshake.workspace = true
 otp-session.workspace = true

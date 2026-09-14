@@ -10,6 +10,8 @@
 //! - `doctor`：WP-15 ② —— core dump / swap / 权限 / FS / 备份风险五类，
 //!   高风险按策略拒绝启动（serve/connect 内嵌同一策略）；
 //! - `book generate|inspect`、`anchor inspect`：§65 —— 只输出公开元数据；
+//! - `anchor init`：wp02 §2.5 —— 首启初始化（v0.1 灰测热修：新端点
+//!   Init 锚的 CLI 落盘路径；O_EXCL 拒覆盖、0600、fsync 文件+父目录）；
 //! - `drain` / `rotate`：§145 **骨架形态**——参数面完整、拒绡任何状态
 //!   变更，完整语义（drain 后不接新会话、双人授权、book_id/version
 //!   原子切换）归 WP-17。
@@ -198,6 +200,18 @@ enum BookCmd {
 
 #[derive(Debug, Subcommand)]
 enum AnchorCmd {
+    /// 首启初始化（wp02 §2.5）：从密码本头读 book_id，向两处介质写同一
+    /// Init 锚（O_EXCL 拒覆盖、0600、fsync 文件+父目录），写完读回校验
+    /// 并打印 inspect 同款摘要。两锚均须不存在——存在即拒绝。
+    Init {
+        /// 密码本路径（book_id 取自其头部；Init 锚不含段材料）。
+        #[arg(long)]
+        book: PathBuf,
+        /// 锚副本 A 路径（须不存在）。
+        path_a: PathBuf,
+        /// 锚副本 B 路径（须不存在；应与 A 位于独立介质）。
+        path_b: PathBuf,
+    },
     /// 检查锚状态（generation/next/一致性；仅公开元数据）。
     Inspect {
         /// 锚文件路径。
@@ -848,34 +862,86 @@ fn run_book(cmd: BookCmd) -> Result<(), CliError> {
 }
 
 fn run_anchor(cmd: AnchorCmd) -> Result<(), CliError> {
-    let AnchorCmd::Inspect { path, path_b, json } = cmd;
-    let a = otp_term_cli::anchorio::inspect_anchor(&path);
-    let b = path_b
-        .as_ref()
-        .map(|p| otp_term_cli::anchorio::inspect_anchor(p));
-    let report = otp_term_cli::anchorio::AnchorInspectReport {
-        a,
-        b: b.unwrap_or(otp_term_cli::anchorio::AnchorStatus {
-            record: None,
-            failure: None,
-        }),
-    };
-    if json {
-        println!("{}", report.to_json(&path, path_b.as_deref()));
-    } else {
-        print!(
-            "{}",
-            otp_term_cli::anchorio::summary(&path, path_b.as_deref(), &report)
-        );
+    match cmd {
+        AnchorCmd::Init {
+            book,
+            path_a,
+            path_b,
+        } => run_anchor_init(book, path_a, path_b),
+        AnchorCmd::Inspect { path, path_b, json } => {
+            let a = otp_term_cli::anchorio::inspect_anchor(&path);
+            let b = path_b
+                .as_ref()
+                .map(|p| otp_term_cli::anchorio::inspect_anchor(p));
+            let report = otp_term_cli::anchorio::AnchorInspectReport {
+                a,
+                b: b.unwrap_or(otp_term_cli::anchorio::AnchorStatus {
+                    record: None,
+                    failure: None,
+                }),
+            };
+            if json {
+                println!("{}", report.to_json(&path, path_b.as_deref()));
+            } else {
+                print!(
+                    "{}",
+                    otp_term_cli::anchorio::summary(&path, path_b.as_deref(), &report)
+                );
+            }
+            if path_b.is_some() && !report.ok() {
+                return Err(CliError::Exit(
+                    1,
+                    "锚检查未通过（存在不可读/损坏副本）".into(),
+                ));
+            }
+            if path_b.is_none() && report.a.record.is_none() {
+                return Err(CliError::Exit(1, "锚检查未通过（不可读/损坏）".into()));
+            }
+            Ok(())
+        }
     }
-    if path_b.is_some() && !report.ok() {
+}
+
+/// `anchor init`：写双 Init 锚 → 打印 anchor inspect 同款摘要（任务 #66）。
+/// 拒绝覆盖/文件系统不支持 = 策略拒绝（退出码 2，与 doctor BLOCK 同档）。
+fn run_anchor_init(book: PathBuf, path_a: PathBuf, path_b: PathBuf) -> Result<(), CliError> {
+    // ① book_id 取自密码本头（打开即验头：损坏/非本文件在此报错）。
+    let header = otp_book::Book::open(&book)
+        .map_err(|e| CliError::Exit(1, format!("密码本打开失败：{e:?}")))?;
+    let book_id = header.header().book_id;
+
+    // ② 写双锚（O_EXCL/0600/fsync 文件+父目录；存在即拒绝）。
+    let summary = otp_term_cli::anchorinit::init_anchor_pair(book_id, &path_a, &path_b).map_err(
+        |e| match e {
+            otp_term_cli::anchorinit::AnchorInitError::AnchorExists { .. }
+            | otp_term_cli::anchorinit::AnchorInitError::SamePath(_)
+            | otp_term_cli::anchorinit::AnchorInitError::UnsupportedFilesystem(_) => {
+                CliError::Exit(EXIT_POLICY_REFUSED, e.to_string())
+            }
+            _ => CliError::Exit(1, e.to_string()),
+        },
+    )?;
+
+    // ③ anchor inspect 同款摘要：重新从盘读回（不信任内存态），并核对
+    //    双锚关系必须 consistent（刚写的两份 Init 不一致即 fail closed）。
+    println!("已写入 Init 双锚（O_EXCL 拒覆盖、0600、fsync 文件+父目录，读回校验通过）：");
+    println!("  book_id : {}", hex(summary.record.book_id.as_bytes()));
+    println!("  anchor_a: {}", summary.path_a.display());
+    println!("  anchor_b: {}", summary.path_b.display());
+    let a = otp_term_cli::anchorio::inspect_anchor(&summary.path_a);
+    let b = otp_term_cli::anchorio::inspect_anchor(&summary.path_b);
+    let report = otp_term_cli::anchorio::AnchorInspectReport { a, b };
+    print!(
+        "{}",
+        otp_term_cli::anchorio::summary(&summary.path_a, Some(&summary.path_b), &report)
+    );
+    let consistent =
+        report.ok() && otp_term_cli::anchorio::relation(&report.a, &report.b) == Some("consistent");
+    if !consistent {
         return Err(CliError::Exit(
             1,
-            "锚检查未通过（存在不可读/损坏副本）".into(),
+            "锚 init 后 inspect 不一致（不应发生；fail closed，请人工检查）".into(),
         ));
-    }
-    if path_b.is_none() && report.a.record.is_none() {
-        return Err(CliError::Exit(1, "锚检查未通过（不可读/损坏）".into()));
     }
     Ok(())
 }
@@ -986,6 +1052,17 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from([
+            "jbuu", "anchor", "init", "--book", "b.book", "a.anchor", "c.anchor",
+        ])
+        .expect("anchor init 可解析");
+        assert!(matches!(
+            cli.command,
+            Cmd::Anchor {
+                cmd: AnchorCmd::Init { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
             "jbuu", "anchor", "inspect", "a.anchor", "b.anchor", "--json",
         ])
         .expect("anchor inspect 双锚可解析");
@@ -1029,6 +1106,111 @@ mod tests {
         })
         .expect_err("rotate 骨架必须显式退出而非空转");
         assert!(matches!(err, CliError::Exit(3, _)));
+    }
+
+    #[test]
+    fn anchor_init_creates_pair_then_inspect_consistent() {
+        // 锚 init 有文件系统白名单（拒绝 tmpfs 等），不能落 std::env::temp_dir
+        // （常见 tmpfs）——用构建树 target/ 下的临时目录（构建盘在白名单内）。
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("otp-cli-init-it-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("e2e.book");
+        let a = dir.join("a.anchor");
+        let b = dir.join("c.anchor");
+        for p in [&book, &a, &b] {
+            std::fs::remove_file(p).ok();
+        }
+
+        run(Cmd::Book {
+            cmd: BookCmd::Generate {
+                path: book.clone(),
+                segments: 16,
+                book_id: Some("00112233445566778899aabbccddeeff".to_string()),
+            },
+        })
+        .expect("生成测试本");
+
+        // ① init 成功创建两锚。
+        run(Cmd::Anchor {
+            cmd: AnchorCmd::Init {
+                book: book.clone(),
+                path_a: a.clone(),
+                path_b: b.clone(),
+            },
+        })
+        .expect("anchor init 应成功");
+
+        // ② inspect 同款口径：payload=init、双锚 consistent、book_id 与本头一致。
+        let sa = otp_term_cli::anchorio::inspect_anchor(&a);
+        let sb = otp_term_cli::anchorio::inspect_anchor(&b);
+        let report = otp_term_cli::anchorio::AnchorInspectReport { a: sa, b: sb };
+        assert!(report.ok(), "双锚均须可校验");
+        let (ra, rb) = (report.a.record.unwrap(), report.b.record.unwrap());
+        assert_eq!(ra, rb, "两锚须为同一记录");
+        assert_eq!(
+            ra.book_id.as_bytes(),
+            b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff"
+        );
+        assert_eq!(ra.next.get(), 0);
+        assert_eq!(ra.generation.get(), 0);
+        assert!(matches!(ra.payload, otp_anchor_spec::AnchorPayload::Init));
+        assert_eq!(
+            otp_term_cli::anchorio::relation(&report.a, &report.b),
+            Some("consistent")
+        );
+        let bytes_a = std::fs::read(&a).unwrap();
+
+        // ③ 重复 init：O_EXCL 拒绝（策略拒绝，退出码 2），且现存锚字节不变。
+        let err = run(Cmd::Anchor {
+            cmd: AnchorCmd::Init {
+                book: book.clone(),
+                path_a: a.clone(),
+                path_b: b.clone(),
+            },
+        })
+        .expect_err("重复 init 必须拒绝");
+        assert!(matches!(err, CliError::Exit(EXIT_POLICY_REFUSED, _)));
+        assert!(err.to_string().contains("已存在"));
+        assert_eq!(std::fs::read(&a).unwrap(), bytes_a, "拒绝时不得改动现存锚");
+
+        // ④ book_id 不匹配的 pad：换一本不同 id 的本再 init → 拒绝且报不匹配。
+        let book2 = dir.join("e2e2.book");
+        run(Cmd::Book {
+            cmd: BookCmd::Generate {
+                path: book2.clone(),
+                segments: 16,
+                book_id: Some("ffeeddccbbaa99887766554433221100".to_string()),
+            },
+        })
+        .expect("生成第二本");
+        let err = run(Cmd::Anchor {
+            cmd: AnchorCmd::Init {
+                book: book2,
+                path_a: a.clone(),
+                path_b: b.clone(),
+            },
+        })
+        .expect_err("book_id 不匹配必须拒绝");
+        assert!(matches!(err, CliError::Exit(EXIT_POLICY_REFUSED, _)));
+        assert!(
+            err.to_string().contains("不匹配"),
+            "报错须明示 book_id 不匹配：{err}"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), bytes_a);
+
+        // ⑤ 供 serve 前置：anchor inspect 子命令本身也过（双锚 consistent）。
+        run(Cmd::Anchor {
+            cmd: AnchorCmd::Inspect {
+                path: a,
+                path_b: Some(b),
+                json: false,
+            },
+        })
+        .expect("inspect 应 ok");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -426,6 +426,7 @@ dependencies = [
  "otp-terminal",
  "otp-transport",
  "otp-types",
+ "rustix",
 ]
 
 [[package]]
