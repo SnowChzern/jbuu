@@ -1,455 +1,602 @@
-# [jbuu][CLI-REDESIGN] CLI 形态 redesign 设计书（直连语义 + 默认端口 + ssh 风格别名）
+# [jbuu][CLI-REDESIGN-V2] CLI 形态 redesign 设计书 v2：端口共存网关 + 公网一等部署形态 + 非交互执行
 
 | 项 | 内容 |
 |---|---|
-| 任务卡 | 论坛任务 #69 · [jbuu][CLI-REDESIGN] CLI 形态 redesign 设计书（直连语义+默认端口+ssh 风格别名）；灰测来源：论坛帖 42 楼 356/358/360（Bug #6：直连、默认端口、别名三需求） |
+| 任务卡 | 论坛任务 #76 · [jbuu][CLI-REDESIGN-V2] 设计书 v2 修订：端口共存网关+公网一等+非交互执行（基于 #69 v1 设计书，芥末 09-15 需求纠偏） |
 | 执行人 | 斗拱（designer） |
-| 设计依据 | 芥末 09-14 产品形态定案两条**原文**（本文不得替换等价物，见 §0.2）；`crates/otp-cli/src/main.rs` 现状 clap 表面（v0.1.1：serve/connect/book/anchor/doctor/drain/rotate 七子命令）；v0.1 runbook（`docs/runbook-rel-0.1.md`：§0.1 mesh-only 铁律、§0.2 SRV_PORT=7717 示例"避开 22/2222/2223"、§5.3 connect/--recover 现行用法）；wp14 门卫设计书（`docs/specs/wp14-doorkeeper-design.md`：22=doorkeeper、sshd 收缩 127.0.0.1:2222、日落条件）；otp-transport `TcpTransport::connect(&str)`（`ToSocketAddrs`，支持主机名）；`--full-otp` 参数挂载点由另一设计书并行定义（本卡只预留 CLI 位，§7） |
+| 前版 | 任务 #69 v1.0（本 workspace 前版全文已并入仓 main：`docs/specs/cli-redesign-design.md`；git 历史可取回 v1 原文） |
+| 设计依据 | ① 芥末 09-14 产品形态定案两条**原文**（v1 §0.2，继续有效，见本文 §0.2）；② **芥末 09-15 需求纠偏**：「网络可达性依赖公网或已有的网络通道」≠只在私网用；7717 与 22 都公网可达，**公网直达=一等部署形态**；「agent/脚本场景是真实用户」（v1 只做交互 PTY 是缺口）——本两条为 v2 全部增量设计的授权来源；③ v1 设计书（#69，已批合 main）；④ wp14 门卫设计书（`docs/specs/wp14-doorkeeper-design.md`：22=doorkeeper、sshd 收缩 `127.0.0.1:2222`+`[::1]:2222`（D10）、警告行冻结常量 §3.1、E1/E2/E3 实证、日落条件 §7.7）；⑤ wp01 线格式（HELLO 帧 52B：`version=0x0002` 大端居帧头 0–1 字节、`msg_type=0x0001`、`payload_len=44`，codec 严格校验 0x0301/0x0302/0x0305）；⑥ RFC 4253 §4.2（SSH 标识串 `"SSH-protoversion-…"` ASCII、连接建立后双方立即发送、前置行规则）；⑦ v0.1 runbook（`docs/runbook-rel-0.1.md`：§0.1 mesh-only 铁律——**本文 §9 起作废该口径**、§3.2 nft 保险带）；⑧ `crates/otp-cli/src/main.rs` 现状 clap 表面（v0.1.1 七子命令） |
 | 状态 | 待芥末批；批准后据此开实现卡（本文不含实现代码） |
-| 范围含 | ①子命令矩阵与直连语义 ②默认端口定值与覆盖链 ③别名配置文件路径/schema/ssh 映射 ④参数与别名优先级规则 ⑤零破坏迁移与 deprecation 策略 ⑥doorkeeper 部署视角配合——任务卡要求全部六项 |
-| 范围不含 | 实现代码与测试代码；协议/线格式/握手/lease 任何变更（WP-01/02/03/12/16 冻结面零触碰）；`--full-otp` 的语义定义（并行卡所有）；serve 侧多路复用/配置中心等新能力；别名通配符、Include、ProxyJump 等 ssh 高级面（§3.6 弃用清单） |
-| 冲突处理 | 本设计与产品定案两条原文冲突＝无效；与冻结规格（WP-01/02/03、wp14）冲突时 fail closed 走设计缺陷流程（规划 §7.2）。硬偏差=0，解读细化 4 条（§14） |
+| 范围含 | 任务卡修订范围全部六项：① 删除 mesh-only 铁律、部署形态重写（公网 7717 一等/mesh 子集）② 7717 端口共存网关（首包嗅探分流+ssh 审计提醒转发+jbuu 正常握手+嗅探层攻击面专节）③ c 侧 fallback 探测 22 + `user@` 语法 ④ `-c '<command>'` 非交互执行形态 ⑤ 与 doorkeeper（wp14）关系重理（端口职责边界图）⑥ 威胁建模联动（标注待门神复核） |
+| 范围不含 | 实现代码与测试代码；协议/线格式/握手/lease 冻结面变更（WP-01/02/03/12/16 零触碰，§12.1 申明复用）；`--full-otp` 语义定义（并行卡，本文仍只登记 §7）；SSH 协议实现（fallback 走 exec 系统 `ssh`，不内置 SSH 客户端）；门神威胁复核卡本体（调度侧另行安排，本文只留待复核清单 §13）；SSH 服务彻底日落后的终态（§9.6 只给联动口径） |
+| 冲突处理 | 与芥末 09-14 两条原文、09-15 纠偏口径冲突＝无效；与冻结规格（WP-01/02/03、wp14）冲突时 fail closed 走设计缺陷流程。v2 相对 v1 硬偏差=0，新增解读细化 R5–R8（§18） |
 
-> 修订记录：v1.0（本次，任务 #69）：初版。
+> **修订记录（v2.0，任务 #76；v1→v2 差异节清单）**
+>
+> | v1 节 | v2 处置 |
+> |---|---|
+> | 头表/§0.1 | 结论 1–10 全保留；新增结论 11–16（公网一等/网关/fallback/user@/-c/威胁联动） |
+> | §0.3 总则 | 总则 1"零破坏"不变；mesh-only 相关表述全部删除，换"公网一等"基线 |
+> | §2 登记表 | 增 `-c/--command`、`--no-ssh-fallback`（直连面）；`--ssh-upstream/--ssh-forward/--sniff-timeout-secs/--sniff-max-conns`（serve 面） |
+> | §3.2 矩阵 | **增 10 行**（user@×4、-c×5、--no-ssh-fallback×1），见 §3.2 v2 增行表 |
+> | §3.4 文法 | 文法增 `[user "@"]` 产生式（v1"无 user@ 前缀"条款**作废**） |
+> | §3.5 | 直连旗面与 connect"同构"原则**破例声明**：-c/user@/fallback 三件为直连面专属 |
+> | §3.6 | "`user@host` 不做"一行**作废**（芥末 09-15 授权补做，理由与边界改见 §11.3） |
+> | §4.3 | 保留缺省 127.0.0.1:7717；增"公网一等≠默认绑公网"说明（§4.4） |
+> | §5.2/§5.4 | schema 增 `user` 字段；§5.4 映射表 `User` 行改写为"对应 user@/user 字段（仅 fallback 透传）" |
+> | §8.1/§8.4 | 兼容矩阵增 v2 增量行；runbook 修订点登记（§8.5） |
+> | **§9 全节** | **整体重写**：v1 §9.3"mesh-only 原样继承"整段**作废**；新 §9 为部署形态/端口职责边界（依据芥末 09-15） |
+> | §9 之后顺延 | v1 §10→本文 §14、§11→§15、§12→§16、§13→§17（增 D17–D28）、§14→§18（增 R5–R8） |
+> | 新增 | §10 端口共存网关、§11 c 侧 fallback 与 user@、§12 -c 非交互执行、§13 威胁建模联动 |
+>
+> 六项修订范围→章节映射（验收对照）：①部署形态重写→§0.3/§4.4/§9；②端口共存网关→§10；③fallback+user@→§11；④-c→§12；⑤doorkeeper 关系→§9.3/§9.4/§9.6；⑥威胁联动→§13。
 
 ---
 
 ## 0. 结论速览与不变式
 
-### 0.1 十条结论（TL;DR）
+### 0.1 结论（TL;DR，1–10 同 v1，11–16 为 v2 新增）
 
 | # | 结论 | 详节 |
 |---|---|---|
-| 1 | 顶层增设可选位置参数 `<host|别名>`：`jbuu 192.0.2.10 --book b.book` 直接连（不带子命令=connect 语义）；七个子命令原样保留，精确子命令词优先于 host 解析 | §3 |
-| 2 | `jbuu` 无参数 → 打印简短帮助（stderr），退出码 2（沿用 clap 既有 usage 口径），**不**隐式连接任何默认目标 | §3.3 |
-| 3 | 默认端口定值 **7717/tcp**（`DEFAULT_JBUU_PORT=7717`）：runbook 现行示例值即 7717（零迁移）、避开 22/2222/2223、避开 Linux 临时端口范围；冻结前须 IANA 注册表复核（冲突则备选 9778） | §4 |
-| 4 | `serve --listen` 缺省 `127.0.0.1:0` → `127.0.0.1:7717`（仍回环安全、`:0`=随机保留；e2e 全部显式 `--listen`，实证零影响） | §4.3 |
-| 5 | 别名配置：`$XDG_CONFIG_HOME/jbuu/config.toml`（缺省 `~/.config/jbuu/config.toml`），TOML，`[alias.<名>]` 表；**只有路径与拓扑，无任何秘密**；serve 侧与 doorkeeper 永不读它 | §5 |
-| 6 | ssh 字段映射核心一条：`IdentityFile`（密钥）→ `book`（密码本），芥末原文②"配置密钥就改成配置密码书" | §5.4 |
-| 7 | 优先级四层阶梯：CLI 旗标 > `host:port` 内嵌端口 > 别名字段 > 内置常量；`host:port` 与 `-p` 同时给且不等 → 报错拒绝 | §6.1 |
-| 8 | 凭据三件套捆绑规则：`--book/--anchor-a/--anchor-b` 一旦 CLI 给出任一件，别名里的凭据三字段**整体不参与**，未给的两件走"同目录锚约定"（book 兄弟 `anchor-a.anchor`/`anchor-b.anchor`） | §6.2/§6.3 |
-| 9 | 迁移零破坏：七子命令、全部现有旗标、退出码语义不动；`connect` 不设 deprecation 时钟（脚本/人机两套入口长期并存，直连为主推口径）；版本 0.2.0（minor） | §8 |
-| 10 | `--full-otp`：仅登记保留名（直连面与 connect 同位挂载），语义归并行设计书；其余卡不得占用该名 | §7 |
+| 1 | 顶层可选位置参数 `<host|别名>` 直连=connect 语义；七子命令原样保留 | §3 |
+| 2 | `jbuu` 无参 → 简短帮助（stderr）+exit 2 | §3.3 |
+| 3 | 默认端口 **7717/tcp**（`DEFAULT_JBUU_PORT=7717`；IANA 复核前置，备选 9778/15717） | §4.1 |
+| 4 | `serve --listen` 缺省 `127.0.0.1:0`→`127.0.0.1:7717`（回环安全缺省不变，公网由部署显式表达） | §4.3/§4.4 |
+| 5 | 别名配置 `$XDG_CONFIG_HOME/jbuu/config.toml`，TOML，`[alias.<名>]`，无秘密 | §5 |
+| 6 | ssh 映射核心：`IdentityFile`→`book` | §5.4 |
+| 7 | 优先级四层阶梯；双端口来源冲突→exit 2 | §6.1 |
+| 8 | 凭据三件套捆绑规则 | §6.2 |
+| 9 | 迁移零破坏：七子命令/旗标/退出码不动；connect 不设 deprecation；版本 0.2.0 | §8 |
+| 10 | `--full-otp` 仅登记（并行卡） | §7 |
+| **11** | **公网 7717 直达=一等部署形态**：`serve --listen [::]:7717` 主推；mesh/私网=同一代码路径的网络子集（v1 mesh-only 铁律作废） | §9.1/§9.2 |
+| **12** | **7717 单口多协议共存网关内置于 serve 进程**：首包三分判别（`"SSH-"` 魔数→审计+提醒+转发 `127.0.0.1:2222`；首字节 `0x00`→jbuu 正常握手；其余/超时→关闭+审计）；判别只看首字节，协议校验全部委托既有 codec（嗅探层零新增解析面） | §10.2 |
+| **13** | **c 侧 ssh fallback**：默认端口 7717 的 TCP 连接失败且未禁用→探测 22（3s），通则 exec 系统 `ssh user@host`；协议层错误绝不 fallback | §11.1/§11.2 |
+| **14** | **`user@` 语法补入直连文法**：jbuu 直连时 user 不参与协议（stderr 恰一行提示），仅 fallback 时透传给 ssh；别名增 `user` 字段 | §11.3/§11.4 |
+| **15** | **`-c '<command>'` 非交互执行**（ssh 同款语义位）：附着 PTY→执行→回显→退出码回传，复用 WP-16 全链；stdout/stderr 合流（等价 `ssh -t`）如实声明 | §12 |
+| **16** | **威胁建模联动**：公网暴露面变化+嗅探层攻击面全部结论标注**待门神复核**（门神卡另行安排，不在本卡） | §13 |
 
-### 0.2 产品定案不变式（芥末 09-14 原文，逐字保真）
+### 0.2 产品定案不变式（芥末 09-14 原文，逐字保真，v2 继续有效）
 
 > ① 「规定一个默认端口；jbuu 就是要去连接的，不带子命令直接走 connect：`jbuu 192.0.2.10 --book <密码书路径>` 就能连上」
 > ② 「后期做成和 ssh 那样可以配别名，ssh 配置密钥就改成配置密码书，其他的不变」
 
-本文全部设计受此两条约束，验收命令即原文命令（§11 E2 必测）：**`jbuu 192.0.2.10 --book <密码书路径>` 必须能连上**（前提：对端 serve 在 7717、锚按约定摆放，见 §6.3——这是"密码书路径"之外唯一新增的前提，申报为解读细化 R1）。②的"后期"= 分期里的 P1（§12），不进 P0。
+**v2 新增授权（芥末 09-15 需求纠偏，本文增量设计的依据原话）**：
+
+> ③ 「网络可达性依赖公网或已有的网络通道」——≠只在私网用；**7717 与 22 都公网可达，公网直达=一等部署形态**。
+> ④ 「agent/脚本场景是真实用户」——v1 直连只做交互 PTY 是缺口，须补 `-c` 非交互执行形态。
+
+验收命令（E2 必测）不变：`jbuu 192.0.2.10 --book <密码书路径>` 必须能连上（锚按 §6.3 同目录约定，解读细化 R1 继承）。②的"后期"=P1（§16）。③落在 §9（部署形态）与 §10（网关）；④落在 §12（-c）。
 
 ### 0.3 设计总则
 
-1. **零破坏**：任何现有命令行（runbook、e2e 测试、论坛帖子里的历史命令）行为不变；唯一申报的行为微变是 §4.3 serve 缺省监听端口。
-2. **最小面**：别名只做"名字→连接参数"一张表，不做 ssh 的 pattern/Include/ProxyJump/多文件合并（§3.6 逐条弃用并给理由）。
-3. **安全口径不放松**：config.toml 无秘密；`allow_unencrypted_swap` **不入**配置（降级开关必须每次显式敲，防配置漂移静默降级）；别名不绕过 doctor/自加固（直连与 connect 走同一条 `run_connect` 路径，doctor 策略原样生效）。
-4. **fail closed + 报错可指路**：解析歧义（双端口来源）、未知别名、缺锚，一律退出码 2 并在报错里给出下一步指针（期望路径/配置文件路径）。
+1. **零破坏**：任何现有命令行（runbook、e2e、论坛历史命令）行为不变；v1 已申报的唯一行为微变（serve 缺省监听端口）维持；v2 全部新增为**增量表面**（新旗标/新文法），零修改既有路径。
+2. **公网一等基线（v2 替换 v1 的 mesh-only 引用）**：设计、文档、示例一律以"7717 公网可达"为默认叙事；mesh/私网部署不再需要特殊说明（同一二进制、同一配置语义，只是监听地址与防火墙口径不同）。**安全缺省不放松**：进程默认监听仍是回环（§4.4），公网暴露是部署者显式动作。
+3. **最小面**：网关只做"首包三分判别+回放+转发"，不解析任何协议内容（wp14 定案 1 同款纪律）；fallback 只 exec 系统 ssh，不内置 SSH 客户端；不设事件钩子等预留面。
+4. **fail closed + 报错可指路**：嗅探窗口超时/第三协议/上游不可达一律关闭连接并留审计行；解析歧义沿用 exit 2+指路文案（§14）。
 
 ---
 
 ## 1. 现状盘点与灰测痛点
 
-### 1.1 现有 CLI 表面（v0.1.1，`crates/otp-cli/src/main.rs`）
+### 1.1 现有 CLI 表面（v0.1.1）——同 v1 §1.1（略，无变化）
 
-| 子命令 | 关键旗标 | 现状语义 |
-|---|---|---|
-| `serve` | `--book --anchor-a --anchor-b --listen(缺省 127.0.0.1:0) --audit-log --sessions --deadline-secs --shell --lease-timeout-ms --allow-unencrypted-swap` | 服务端（mesh-only 口径靠运维遵守，代码不强制） |
-| `connect` | `--book* --anchor-a* --anchor-b* --target*(host:port) --recover --audit-log --deadline-secs --allow-unencrypted-swap`（*=必填） | 客户端；`--target` 只收字面地址 |
-| `book` | `generate PATH --segments/--book-id`；`inspect PATH --json` | 离线工具 |
-| `anchor` | `inspect PATH [PATH_B] --json` | 只读检查 |
-| `doctor` | `--book --anchor-a --anchor-b --json --allow-unencrypted-swap` | 环境体检 |
-| `drain` / `rotate` | （骨架，退出码 3，WP-17） | 骨架 |
+七子命令 `serve/connect/book/anchor/doctor/drain/rotate`；顶层必选子命令；`connect --target` 只收字面地址；`serve --listen` 缺省 `127.0.0.1:0`。
 
-顶层为**必选子命令**（`command: Cmd` 无 Option），`jbuu` 裸跑即 clap usage 错误。
+### 1.2 痛点（v1 三条 + v2 新增两条）
 
-### 1.2 灰测痛点（帖 42 楼 356/358/360，Bug #6 三需求）
-
-1. 每次连接要敲四个长旗标（book+双锚+target），比 `ssh 别名` 长得多；
-2. 端口是站点自选的裸值，无产品级缺省，客户端/服务端要互相问；
-3. 没有别名机制，跨多台 server 时凭路径记忆操作。
-
-本设计一次性回应三条 + 芥末定案两条。
+1. 连接命令长（v1：三需求之别名）；2. 端口无产品缺省（v1）；3. 无别名（v1）；
+4. **（v2）公网用户无法直达**：runbook §0.1 mesh-only 铁律把公网用户挡在门外，与芥末 09-15 事实纠偏冲突——7717 本就公网可达可用，需要端口共存故事（§10）与部署一等口径（§9）；
+5. **（v2）agent/脚本无法非交互执行**：直连只有交互 PTY 形态，CI/agent 场景（芥末：真实用户）没有"执行一条命令拿退出码"的入口（§12）。
 
 ---
 
-## 2. 总体形态：一张表面登记表
-
-CLI 表面自此按**登记表**管理（新旗标/新名须先登记再实现，防名字被抢注）：
+## 2. 总体形态：一张表面登记表（v2 增补行加粗）
 
 ```
 jbuu                              → 简短帮助（stderr，exit 2）
 jbuu --help | -h | -V | --version → 帮助/版本（exit 0）
 jbuu <子命令> [旗标…]              → 七子命令，全部现状语义不变
-jbuu [旗标…] <host|别名> [旗标…]    → 直连 = connect 语义（新）
-jbuu -- <host|别名> …              → 直连；-- 之后 token 不再匹配子命令（逃生门）
+jbuu [旗标…] <host|别名> [旗标…]    → 直连 = connect 语义（v1）
+jbuu -- <host|别名>                → 直连；-- 之后 token 不再匹配子命令（逃生门，v1；-- 后仅收 host 一个位置参数，§12.2）
 ```
 
-直连旗面（v1，与 connect 子命令旗面同构、收敛到同一 `run_connect`）：
-`--book`、`--anchor-a`、`--anchor-b`、`-p/--port <u16>`、`--recover <u64>`、`--audit-log`、`--deadline-secs`、`--allow-unencrypted-swap`、`--config <path>`（别名文件定位，§5.1）；
-**预留**：`--full-otp`（§7）。
+直连旗面（v2 全量）：`--book`、`--anchor-a`、`--anchor-b`、`-p/--port <u16>`、`--recover <u64>`、`--audit-log`、`--deadline-secs`、`--allow-unencrypted-swap`、`--config <path>`（v1 全量）＋ **`-c/--command <cmd>`（§12）**、**`--no-ssh-fallback`（§11.1）**；token 文法增 **`user@` 前缀（§11.3）**。
+serve 旗面增：**`--ssh-upstream <addr>`（默认 `127.0.0.1:2222`，仅回环，§10.7）**、**`--ssh-forward on|off`（默认 on，§10.7）**、**`--sniff-timeout-secs <u16>`（默认 10，钳 1..60）**、**`--sniff-max-conns <u32>`（默认 64，钳 1..1024）**。
+预留：`--full-otp`（§7，并行卡所有）。
 
 ---
 
-## 3. ① 子命令矩阵与直连语义
+## 3. ① 子命令矩阵与直连语义（v1 §3 全保留 + v2 增补）
 
-### 3.1 解析总规则（clap 落地方式）
+### 3.1 解析总规则
 
-- `Cli { #[command(subcommand)] command: Option<Cmd>, #[command(flatten)] direct: DirectForm }`，`DirectForm { host: Option<String> /* 顶层位置参数 */, …connect 旗面 }`。
-- 分派：`command=Some` → 现状路径（一行不改）；`command=None 且 host=Some` → 直连；`command=None 且 host=None 且直连旗面全空` → 帮助+exit 2；`command=None 且 host=None 但直连旗面非空`（如 `jbuu --book b`）→ usage 错误 exit 2（"给了连接旗标但缺 <host>"）。
-- **子命令词优先**：第一个非旗标 token 精确等于七个子命令名（大小写敏感）→ 一律按子命令。`jbuu connect` 永远是子命令，不会被当作别名/主机名。
-- **`--` 逃生门**：`jbuu -- serve` 中 `serve` 在 `--` 之后，clap 不再作子命令匹配 → 按位置参数处理（host="serve"，走别名/地址解析）。极端情况（主机名真叫 serve）的唯一逃生门；日常用不到，登记备查。
+同 v1 §3.1：`command=Some`→子命令路径；`command=None 且 host=Some`→直连；旗标给了缺 host→exit 2；子命令词精确匹配优先；`--` 逃生门（`--` 之后 token 不再作子命令匹配；v2 细化：`--` 之后**只收 host 一个位置参数**，见 §12.2）。
 
-### 3.2 完整矩阵（每行一条单测，§11 T 组）
+### 3.2 完整矩阵（v1 十六行全部保留，逐行不变；下表为 **v2 增行**，与 v1 行合起来每行一条单测）
 
 | 命令行 | 解析结果 | 退出码 |
 |---|---|---|
-| `jbuu` | 简短帮助（stderr） | 2 |
-| `jbuu --help` / `--version` | 帮助/版本 | 0 |
-| `jbuu serve --book b …` | 子命令（现状） | 现状 |
-| `jbuu connect --target 10.0.0.1:7717 …` | 子命令（现状；`--target` 只收字面地址，**不**解析别名，D5） | 现状 |
-| `jbuu book|anchor|doctor|drain|rotate …` | 子命令（现状） | 现状 |
-| `jbuu 192.0.2.10 --book b.book` | **直连**（芥末原文①命令） | 远端 shell 码/1/2 |
-| `jbuu 192.0.2.10:7790 --book b.book` | 直连，内嵌端口 7790 | 同上 |
-| `jbuu ops`（ops=已配置别名） | 直连，别名展开（P1 起） | 同上 |
-| `jbuu ::1 --book b` | 直连，IPv6 字面量（多冒号=纯地址，默认端口） | 同上 |
-| `jbuu [2001:db8::1]:7790 --book b` | 直连，IPv6+端口必须方括号 | 同上 |
-| `jbuu -p 7790 ops` | 直连，别名+旗标端口 | 同上 |
-| `jbuu -- serve` | 直连（-- 逃生门） | 同上 |
-| `jbuu --book b`（无 host） | usage 错误："连接旗标已给但缺 <host>" | 2 |
-| `jbuu 1.2.3.4 2.3.4.5` | usage 错误：直连只收一个位置参数 | 2 |
-| `jbuu nosuch` | 未知别名/无法解析为地址（报错含配置路径提示） | 2 |
-| `jbuu --book X serve …` | `serve` 是首个非旗标 token → 子命令路径；顶层旗标与子命令不同层不共享 → serve 自身 usage 错误（提示 serve 需要自己的 `--book`） | 2 |
+| `jbuu ops@192.0.2.10 --book b` | 直连 user="ops" host=192.0.2.10；jbuu 路径忽略 user（stderr 恰一行提示，R5）；fallback 时透传 `ops@192.0.2.10` | 远端码/1/2 |
+| `jbuu deploy@lab-mesh.internal` | 直连 user+主机名（别名/DNS 路径不受 user 影响） | 同上 |
+| `jbuu ops@[2001:db8::1]` | 直连 user+IPv6（user@ 只与"整个 addr"组合，方括号内不拆） | 同上 |
+| `jbuu @192.0.2.10` | usage 错误：user 为空 | 2 |
+| `jbuu 192.0.2.10 -c 'uptime'` | 直连+非交互执行（§12）；退出码=远端命令退出码 | 0/N/1/2 |
+| `jbuu -c 'uptime' 192.0.2.10` | 同上（直连旗标可前置于 host，clap 默认允许交错） | 同上 |
+| `jbuu host:7790 -c 'w'` | 内嵌端口+-c 组合；**显式端口→禁用 fallback（D24）** | 同上 |
+| `jbuu host -c` | clap 缺值错误 | 2 |
+| `jbuu -- serve -c 'x'` | usage 错误：`--` 之后只收 host 一个位置参数（§12.2，T15） | 2 |
+| `jbuu 192.0.2.10 --no-ssh-fallback` | 直连，禁用 22 探测（§11.1） | 远端码/1/2 |
 
-### 3.3 无参数默认行为（裁决 D2）
+v1 十六行（裸 jbuu/帮助/七子命令/芥末命令①/host:port/别名/IPv6 两形态/-p 组合/`--` 逃生门/缺 host/双位置/未知别名/串层）原样有效，不再重抄；其中"直连只收一个位置参数"行由 v2 的 `-- serve -c` 行细化边界。
 
-**打印简短帮助，退出码 2。** 备选与否决：
-- 默认连"默认别名"——**否**：隐式连接是危险魔法（连错机器、消耗段），且与"锚/本是否就绪"耦合，报错路径反而深；
-- 进交互选单/TUI——**否**：YAGNI，团队三人；
-- 帮助+exit 0——**否**：与 clap `arg_required_else_help` 既有口径一致（exit 2），脚本可区分"成功"与"没给参数"。
+### 3.3 无参数默认行为
 
-退出码 2 在现状已双役（clap usage 错误与策略拒绝共用，`EXIT_POLICY_REFUSED=2`），本设计不新增混淆，仅登记（§10）。
+同 v1 §3.3（D2：帮助+exit 2，不隐式连接）。v2 不变。
 
-### 3.4 `<host|别名>` token 文法
+### 3.4 `<host|别名>` token 文法（v2 修订：v1"无 user@ 前缀"条款作废）
 
 ```
 token     := 子命令词（7 个，精确匹配）          → 子命令
            | 别名键（config 命中，键精确匹配）    → 别名展开（P1）
-           | addr                                  → 直连地址
-addr      := host | host ":" port | "[" host6 "]" ":" port
+           | direct                                  → 直连
+direct    := [ user "@" ] addr                       # v2 新增产生式（依据芥末 09-15 ③关联需求）
+user      := 1..32 字符，字符集 [A-Za-z0-9_.-]        # 与 ssh 允许集一致；空 user → exit 2
+addr      := host | host ":" port | "[" host6 "]" ":" port   # 同 v1
 host      := IPv4 字面量 | IPv6 字面量 | 主机名/DNS 名
 port      := u16 十进制
 ```
 
-- 判定序**别名先于 DNS**（ssh 同款：`Host ops` 优先于解析 `ops.` 域名）；别名名校验（§5.3）禁止形似地址/含 `:`，二者无交集。
-- 无 `user@` 前缀：锦书无用户概念（身份=book_id，握手内核对），芥末②"其他的不变"下**故意省略**（登记表不收该语法）。
-- 主机名交给 `TcpTransport::connect` 的 `ToSocketAddrs` 解析（现状能力，无新增解析器）。
+- `@` 不在别名字符集（§5.3 `[A-Za-z0-9_-]`），user@ 与别名键**无交集**，判定序不变（别名先于 DNS）。
+- `user@` 只与"整个 addr"结合：`ops@[2001:db8::1]` 中 user=ops、addr=`[2001:db8::1]`（方括号体不参与 user 拆分）。
+- user 的消费语义：**直连 jbuu 成功时不参与协议**（jbuu 身份=book_id，握手内核对），仅打印一行 stderr 提示（R5）；**仅在 fallback 到 ssh 时透传**（§11.2）。
 
-### 3.5 直连旗面与既有旗面的关系
+### 3.5 直连旗面与 connect 的关系（v2 破例声明）
 
-- 直连旗面与 `connect` 旗面**同构**（`--target` 除外——位置参数替代之），实现上 flatten 后共用 `ConnectArgs` 构造，`run_connect` 一条路径：doctor、自加固、审计、恢复、握手、PTY、退出码传递全部复用，**直连不引入任何策略旁路**。
-- 顶层旗标与子命令旗标不同层、不共享（clap 语义），§3.2 末行行为登记。
+v1"同构"原则维持于：`--book/--anchor-*/-p/--recover/--audit-log/--deadline-secs/--allow-unencrypted-swap` 收敛同一 `ConnectArgs`/`run_connect`。v2 **三件为直连面专属、connect 不收**（D28，零破坏：connect 是冻结脚本入口）：
 
-### 3.6 明确不做（防蔓延清单，评审可增不可减）
+| 直连专属件 | connect 是否收 | 理由 |
+|---|---|---|
+| `-c/--command` | 否 | connect=脚本既有入口，脚本已自有命令执行方式；-c 的用户=直连人机/agent |
+| `user@` 前缀 | 否（`--target` 仍只收字面地址，D5 继承） | user 只服务 ssh fallback；connect 无 fallback 行为 |
+| fallback（含 `--no-ssh-fallback`） | 否 | fallback 是直连形态的迁移期体验件，不进冻结子命令 |
 
-| ssh 能力 | 不做理由 |
+### 3.6 明确不做（v2 修订表：原 `user@host` 行作废，其余 v1 行不变）
+
+| 能力 | v2 处置 |
 |---|---|
-| `Host` 通配 pattern、多段叠加、`Host *.lan` | 三人团队无此规模；叠加语义是 ssh config 复杂度之首 |
-| `Include`、多配置文件合并 | 同上；单文件 `--config` 旗标足矣 |
-| `ProxyJump`/`ProxyCommand` | 网络可达性由 mesh VPN 承担（runbook §0.1 铁律），CLI 层做跳板等于鼓励绕过 mesh-only |
-| `user@host` | 无用户概念（§3.4） |
-| 别名里嵌 shell 命令/`LocalForward` 等 | 远超"名字→参数"最小面 |
-| `connect --target` 解析别名 | 冻结面不加隐式行为；直连=人机入口、connect=脚本/测试入口，两套口径清晰（D5） |
+| ~~`user@host` 不做（v1：无用户概念）~~ | **作废**→补做（§11.3）：jbuu 协议仍无用户概念（v1 论据成立），但 user 作为 **fallback 透传件**有真实语义（芥末 09-15 ③：7717/22 双公网可达，22 链路是 ssh 的、有用户） |
+| 位置参数命令形态（`jbuu host 'cmd'`，ssh 式第二位置参数） | **不做**：v1"直连只收一个位置参数"规则保留，-c 是唯一命令门（少一个歧义源；`--` 逃生门语义也得以保持简单） |
+| Host 通配/Include/ProxyJump/别名字段面 | 不做，理由同 v1（ProxyJump 行的"mesh VPN 承担"改述为"网络可达性由公网直达或既有通道承担"——芥末 09-15 ③原话口径） |
+| `connect --target` 解析别名 | 不做（D5 继承） |
 
 ---
 
-## 4. ② 默认端口：定值建议与覆盖方式
+## 4. ② 默认端口（v1 §4 全保留；§4.4 为 v2 增补）
 
-### 4.1 定值裁决（D6）：`7717/tcp`
+### 4.1–4.3 定值 7717 / 覆盖链 / serve 缺省 127.0.0.1:7717
 
-| 准则 | 7717 的表现 |
-|---|---|
-| 避开部署现役端口 | 22（doorkeeper 公网）、2222（sshd 回环收缩，wp14 D10）、2223（门卫影子期，runbook §4.4b）——runbook §0.2 注释本就要求"避开 22/2222/2223"，7717 正是现行示例值 |
-| 避开 Linux 临时端口范围 | 默认 `ip_local_port_range` 32768–60999，7717 在其下 |
-| 不需特权 | >1024，systemd DynamicUser 无 CAP_NET_BIND_SERVICE 也能绑 |
-| 迁移成本 | **零**：v0.1 runbook 的 SRV_PORT 示例即 7717，已按此部署的站点无感 |
-| 记忆 | "七七一七"，四键节奏；产品常量名 `DEFAULT_JBUU_PORT` |
+同 v1 §4.1–§4.3，零改动（D6/D14/D15 继承；IANA 复核前置、备选 9778/15717；`host:port`+`-p` 冲突 exit 2）。
 
-**冻结前置条件**：对 IANA Service Name and Transport Protocol Port Number Registry 复核 7717/tcp 未注册（本设计离线撰写无法联网复核，**申报为批准前检查项**）；若已被注册，备选序：`9778`、`15717`（同准则筛选），定值只改本节与常量，矩阵/schema 不动。
+### 4.4 【v2 增补】公网一等 ≠ 默认绑公网
 
-**否决的候选**：22（与门卫冲突且冒充 ssh 端口引人误解）；2222/2223（runbook 已占）；<1024（需特权，与 systemd 加固单元冲突）；32768–60999（临时端口，bind 可能失败或抢走出站端口）；随机端口（违反"规定一个默认端口"的定案①本身）。
-
-### 4.2 覆盖链（客户端，端口解析优先级）
-
-```
-内嵌端口 host:port / [v6]:port     ←最高
-    └─ 与 -p/--port 同给且不等 → usage 错误 exit 2（拒绝二义，不静默择一）
--p/--port <u16>
-别名 port 字段（§5）
-DEFAULT_JBUU_PORT = 7717（编译期常量，无配置文件级全局覆盖）
-```
-
-全局 `default_port` 配置项**不设**（YAGNI 申报）：改默认端口只有产品发布一条路，测试/多站点用 `-p`/`--listen` 显式表达；开放配置项等于第二真相源。
-
-### 4.3 serve 侧配合（申报的行为微变）
-
-`serve --listen` 缺省 `127.0.0.1:0` → **`127.0.0.1:7717`**：
-- 仍默认回环（不扩大暴露面，mesh-only 靠运维传 `--listen ${MESH_IP}:7717` 的口径不变）；
-- `:0`=随机的语义保留（并行测试逃生门）；
-- 风险评估：`LISTEN=` stderr 行照打实际地址（行格式冻结），解析脚本零影响；e2e 三处 serve 全部显式 `--listen 127.0.0.1:0`（`e2e_tcp.rs:369/515/639`，实证），唯一受影响场景是"同机裸跑两个不传 `--listen` 的 serve"，属开发边角，报 EADDRINUSE 即自解释；
-- 收益：`jbuu serve` + `jbuu 127.0.0.1 --book b` 两个裸命令即可本机冒烟，闭环定案①。
+- 进程缺省监听仍 `127.0.0.1:7717`（回环安全缺省，v1 D14 不变）；**公网一等形态由部署显式表达**：`serve --listen [::]:7717`（或 `0.0.0.0:7717`，IPv6 禁用环境；wp14 D10 同款双栈口径），由 runbook systemd 单元示例主推（§8.5）。
+- 理由：①"一等"指**形态、文档、安全分析的默认叙事**，不是把暴露决定内置进二进制——默认公网监听对不知情升级者是破坏性惊喜，违零破壊总则 1；②nft 保险带（§9.5）与 systemd 单元是暴露的真正开关，集中一处；③mesh 子集形态与回环冒烟形态共用同一默认，无需分叉。
 
 ---
 
-## 5. ③ 别名配置文件：路径、schema、ssh 映射
+## 5. ③ 别名配置文件（v1 §5 全保留 + user 字段）
 
-### 5.1 路径与发现规则（D7）
+### 5.1 路径与发现规则
 
-- 唯一来源：`$XDG_CONFIG_HOME/jbuu/config.toml`；`XDG_CONFIG_HOME` 未设时 `~/.config/jbuu/config.toml`（XDG Base Directory 规范缺省）。
-- 顶层旗标 `--config <path>` 覆盖（ssh `-F` 的对应物；测试/多环境用）。
-- 文件不存在＝空别名表（**不是错误**，首次使用体验：`jbuu ops` → "未知别名 ops（配置文件 <路径> 不存在；初始化示例见 --help）"）。
-- 不设 `/etc/jbuu/` 系统级客户端配置：book 本就是每用户一份，多用户共享别名只会诱导共享 book 副本的误操作。
-- 权限建议 0600（含拓扑信息，非秘密但属侦察面）；`doctor --config`（P2）对其 >0600 给 warn。
+同 v1 §5.1（D7：XDG 单文件、`--config` 覆盖、缺文件=空表、0600 建议）。
 
-### 5.2 Schema（TOML，`[alias.<名>]`）
+### 5.2 Schema（TOML；v2 增一行字段，其余同 v1）
 
 ```toml
-# ~/.config/jbuu/config.toml —— 锦书客户端别名（无任何秘密，只有路径与拓扑）
-# 字段名与 connect 旗标一一对应；未知字段按错误处理（拒绝 typo 静默失效）。
-
-[alias.ops]                     # jbuu ops → 直连此表
-host  = "192.0.2.10"         # 必填：IPv4/IPv6/主机名（无 user@）
-port  = 7717                    # 可选：缺省 DEFAULT_JBUU_PORT
-book  = "~/jbuu-cli/otp.book"   # 可选：密码本路径（芥末②：密钥位改密码书位）
-anchor_a = "~/jbuu-cli/anchor-a.anchor"   # 可选：缺省走同目录锚约定（§6.3）
-anchor_b = "~/jbuu-cli/anchor-b.anchor"   # 可选：同上
-deadline_secs = 120             # 可选：缺省 120（同 connect）
-audit_log = "~/jbuu-cli/audit.jsonl"      # 可选：缺省不落盘
-
-[alias.lab]
-host = "lab-mesh.internal"      # 主机名交给 ToSocketAddrs
-book = "~/lab/otp.book"         # 不给 anchor_*：用 ~/lab/ 下约定锚
+[alias.ops]
+host  = "192.0.2.10"         # 必填：IPv4/IPv6/主机名
+port  = 7717                     # 可选：缺省 DEFAULT_JBUU_PORT
+user  = "ops"                    # 可选（v2 新增）：仅 ssh fallback 透传；jbuu 直连忽略并提示一行
+book  = "~/jbuu-cli/otp.book"   # 可选：密码本路径
+anchor_a = "~/jbuu-cli/anchor-a.anchor"
+anchor_b = "~/jbuu-cli/anchor-b.anchor"
+deadline_secs = 120
+audit_log = "~/jbuu-cli/audit.jsonl"
 ```
 
-| 字段 | 类型 | 必填 | 缺省 | 对应 connect 旗标 |
+| 字段 | 类型 | 必填 | 缺省 | 对应 |
 |---|---|---|---|---|
-| `host` | string | 是 | — | `--target` 的地址部分 |
-| `port` | u16 | 否 | 7717 | `-p/--port`（及 `host:port` 内嵌） |
-| `book` | path | 否¹ | — | `--book` |
-| `anchor_a` / `anchor_b` | path | 否¹ | book 同目录约定 | `--anchor-a/-b` |
-| `deadline_secs` | u64 | 否 | 120 | `--deadline-secs` |
-| `audit_log` | path | 否 | 不落盘 | `--audit-log` |
-| `recover` | — | **不设** | — | 会话态（TERMINAL 行打印的 handle）不入持久配置 |
-| `allow_unencrypted_swap` | — | **不设** | — | 安全降级开关必须每次显式敲（§0.3 总则 3，D11） |
-| `full_otp` | — | **预留** | — | §7 并行卡定，本表不收 |
+| `host`/`port`/`book`/`anchor_a`/`anchor_b`/`deadline_secs`/`audit_log` | 同 v1 | 同 v1 | 同 v1 | 同 v1 |
+| **`user`（v2）** | string | 否 | 无（ssh 用本机用户名缺省） | CLI `user@` 前缀的等价物；仅 fallback 透传（§11.4） |
+| `recover`/`allow_unencrypted_swap`/`full_otp` | 不设 | — | — | 同 v1（D9/D11/D12 继承） |
 
-¹ 别名不给 `book` 时：连接前必须从 CLI `--book` 得到，否则 exit 2（"别名 ops 未配置 book，且未给 --book"）。
+解析纪律同 v1：`serde`+`deny_unknown_fields`、`~` 前导展开、`no_ssh_fallback` **不入表**（一次性决策用旗标，非站点属性，YAGNI 申报）。
 
-解析纪律：`serde` + `#[serde(deny_unknown_fields)]`（未知字段=错误，退出码 2，报错含行列号）；路径支持前导 `~` 展开（其余位置 `~` 按字面）；TOML 同名 `[alias.ops]` 重复由 TOML 解析器天然拒绝。
+### 5.3 别名校验规则 / 5.4 ssh 映射表
 
-### 5.3 别名校验规则（config 加载时，违规=exit 2 并点名）
+5.3 同 v1（三条；`@` 天然被字符集排除）。5.4 仅改两行：
 
-1. 非空；字符集 `[A-Za-z0-9_-]`（首字符字母/数字）；
-2. 不得等于七个子命令名（`serve/connect/book/anchor/doctor/drain/rotate`）；
-3. 不得形似地址：不得匹配 IPv4/IPv6 字面量，不得含 `:` `/` `\` 空格。
-
-### 5.4 与 ssh config 的字段映射表（芥末②"其他的不变"的对照基准）
-
-| OpenSSH `ssh_config` | jbuu 对应 | 差异说明 |
+| OpenSSH `ssh_config` | jbuu 对应（v2） | 差异说明 |
 |---|---|---|
-| `Host <别名>` | `[alias.<名>]` | 单别名单表；不支持 pattern 通配（§3.6） |
-| `HostName` | `host` | 同义 |
-| `Port`（缺省 22） | `port`（缺省 7717） | 缺省值不同 |
-| **`IdentityFile`（密钥）** | **`book`（密码本）** | **芥末②核心映射："配置密钥就改成配置密码书"** |
-| `CertificateFile` / `AddKeysToAgent` / `IdentitiesOnly` | — | 无对应（无证书/代理概念） |
-| `User` | — | 无用户概念：身份=book_id，握手内核对（§3.4） |
-| `UserKnownHostsFile` / `StrictHostKeyChecking` | — | 无 TOFU 知名主机库：对端真实性由"同本同 book_id"E2E 互证承载，故意不引入 |
-| `ProxyJump` / `ProxyCommand` | — | mesh VPN 是网络层答案（§3.6） |
-| `ServerAliveInterval` | — | connect 心跳固定 1s（协议无 lease 协商通道，main.rs 既有注释），不开放配置 |
-| `ConnectTimeout` | `deadline_secs` | 语义近似（锦书=握手+附着整体超时） |
-| `Compression` / `Ciphers` / `MACs` | — | 协议冻结（WP-01/03），无算法协商面 |
-| `LogLevel` / `Verbose` | — | 状态面统一 stderr，无级别旋钮 |
-| `Include` | — | v1 不做（§3.6） |
-| `-F <file>`（命令行） | `--config <path>` | 同位 |
-| `-p <port>`（命令行） | `-p/--port` | 同位；另支持 `host:port` 内嵌（ssh 无此语法，属 ssh scp/sftp 家族习惯） |
-| `-i <keyfile>`（命令行） | `--book` | 同位映射 |
+| `User` | `user@` 前缀 / 别名 `user` 字段 | v2 修订：**仅 fallback 到 ssh 时透传**；jbuu 协议无用户概念，直连路径忽略+一行提示（R5） |
+| `ProxyJump`/`ProxyCommand` | — | 网络可达性由公网直达或既有通道承担（芥末 09-15 ③口径），CLI 层不做跳板 |
+
+其余行（HostName/Port/IdentityFile→book/ConnectTimeout 等）同 v1 §5.4。
 
 ---
 
-## 6. ④ 参数与别名的优先级/覆盖规则
+## 6. ④ 优先级/覆盖规则（v1 §6 全保留；user 不入阶梯）
 
-### 6.1 总阶梯（ssh 同构：命令行 > 配置 > 内置）
+### 6.1–6.3 四层阶梯 / 凭据捆绑 / 同目录锚
 
-```
-① CLI 旗标（--book/--anchor-*/-p/--recover/--deadline-secs/--audit-log/--allow-unencrypted-swap）
-② host token 内嵌端口（host:port）
-③ 别名表字段（port/book/anchor_*/deadline_secs/audit_log）
-④ 同目录锚约定（仅 anchor_a/anchor_b，且仅当 book 已知且旗标未显式给锚）
-⑤ 内置常量（DEFAULT_JBUU_PORT=7717、deadline 120s 等）
-```
+同 v1 §6.1–§6.3（D10/D11 继承；②与 `-p` 冲突 exit 2）。
 
-特例（拒绝二义）：②与 `-p` 同给且不等 → exit 2。`--recover`、`--allow-unencrypted-swap` 只存在于旗标层（配置不收，§5.2）。
-
-### 6.2 凭据三件套捆绑规则（D10，与逐字段覆盖的取舍）
-
-`book`/`anchor_a`/`anchor_b` 是一组**同 book_id 凭据**（allocator 会做 `expected_book_id` 核对，混配必然启动失败）。若采用 ssh 式逐字段覆盖，`jbuu ops --book /新本` 会得到"别名锚 × 新本"的混配，错误迟至 allocator 打开才爆，报错远离肇事参数。**故裁定捆绑**：
-
-> CLI 一旦显式给出三件套中**任一**旗标，别名表中的**三个凭据字段整体不参与**本次解析；解析结果=CLI 旗标 + 同目录锚约定补缺。CLI 一件未给时，三件套整体取别名（缺 book 参见 §5.2 脚注¹）。
-
-效果示例：
-- `jbuu ops --book ~/lab/otp.book` → 用 ~/lab/otp.book + ~/lab/ 下约定锚（别名凭据全弃，host/port 沿用别名）——正是"拿新本副本试连"的正确行为；
-- `jbuu ops` → 三件全取别名；
-- `jbuu 1.2.3.4 --book b` → CLI 凭据 + 内置端口（别名根本没参与，`host` 是地址不是别名）。
-
-### 6.3 同目录锚约定（D11）
-
-`--book P`（或别名 `book=P`）且未显式给锚时：取 `P` 所在目录下 `anchor-a.anchor`、`anchor-b.anchor`。依据：runbook §5.2 客户端初始化本就把三件并排放在 `~/jbuu-cli/`（book/anchor-a.anchor/anchor-b.anchor），约定=把现行最佳实践升格为缺省。**缺失时不自动创建**（"绝不顺手创建空锚毁现场"纪律，serve 侧既有口径同源）：报错 exit 2，并列出两个期望路径与 `--anchor-a/-b` 用法。这让芥末命令① `jbuu 192.0.2.10 --book <密码书路径>` 的"只给一个路径"成立（解读细化 R1 申报：原文未提锚，本设计以约定补足而非省略锚）。
+**v2 附注**：`user` **不进入端口/凭据阶梯**——它不是 jbuu 连接参数。其取值序单独一条：CLI `user@` > 别名 `user` 字段 > 无（fallback 时由 ssh 用本机用户名缺省）；直连成功时取到也只用作提示。
 
 ---
 
-## 7. `--full-otp` CLI 位预留（并行卡接口）
+## 7. `--full-otp` CLI 位预留
 
-- **本卡只做登记**：名字 `--full-otp` 在表面登记表（§2）标记为"预留，语义由并行设计书定"；P0/P1 实现**不**添加该旗标，避免抢跑语义。
-- **挂载位约定**（并行卡可直接引用）：直连旗面与 `connect` 旗面**同位**挂载（两者收敛于同一 `ConnectArgs`，天然一致）；旗标长名 `--full-otp`，短名不预留。
-- 实现顺序协调：若并行卡先批，实现卡合并其挂载；若后批，加旗标属纯增量（新增 flag 不破坏任何现有调用）。
+同 v1 §7 逐字（仅登记、直连与 connect 同位挂载、并行卡所有、不抢跑语义）。v2 不触碰。
 
 ---
 
-## 8. ⑤ 迁移路径：零破坏与 deprecation 策略
+## 8. ⑤ 迁移路径：零破坏（v1 §8 保留 + v2 增量）
 
-### 8.1 兼容矩阵（现状命令逐条裁定）
+### 8.1–8.4 兼容矩阵 / deprecation / 版本依赖 / 文档增补（v1 保留）
 
-| 现有面 | 裁定 |
+v1 §8.1–§8.3 全部继承；v1 §8.4（文档与帮助面增补）四项由本文 §8.5 承接并增补 user/-c 示例。v2 增补三行到兼容矩阵：
+
+| v2 新增面 | 裁定 |
 |---|---|
-| 七个子命令 | 原样保留，语义/旗标/必填性零改动 |
-| `connect --target` | 原样保留；仍只收字面 `host:port`（D5） |
-| 全部退出码口径（0/N 回传/1/2/3） | 不变；新增使用错误仍落 2（§10 登记） |
-| `serve --listen` 缺省 | **唯一申报微变**：`127.0.0.1:0`→`127.0.0.1:7717`（§4.3，风险已评估≈0） |
-| `LISTEN=`/`READY=` stderr 行格式 | 冻结不动 |
-| e2e/集成测试 | 全部显式 `--listen`，零改动实证 |
+| serve 四个新旗标（`--ssh-upstream/--ssh-forward/--sniff-timeout-secs/--sniff-max-conns`） | 纯增量；缺省即网关生效（on/127.0.0.1:2222/10s/64） |
+| serve 7717 监听前置嗅探 | jbuu 客户端无感知（客户端本就先发 HELLO，§10.4）；既有 e2e（显式 `--listen 127.0.0.1:0`）回归锚=G2/T12 |
+| 直连面 `-c/user@/--no-ssh-fallback` | 纯增量；七子命令与既有旗标零改动（D28） |
 
-### 8.2 deprecation 策略（D13）
+版本仍 **0.2.0**（v1 未及实现即被 v2 取代，一次 minor 承载全部）；新依赖同 v1（toml+serde）；网关/fallback 无新三方依赖（TcpStream/Command 标准库）。
 
-- **不设 deprecation 时钟，不删任何入口**：直连=人机主推口径（文档/帮助首例），`connect`=脚本/CI/测试入口，长期并存。理由：无遥测可依，人工判据（论坛反馈）不足以定时钟；两入口同收敛 `run_connect`，维护成本≈单入口。
-- 若未来确要收口，另开 RFC 卡，届时以"帮助面降权→发布说明弃用告警→大版本移除"三步走，不在本卡预支。
-- runbook §5.3 的 connect 命令**不要求改写**（照抄仍有效），但 v0.2 文档增补直连/别名为首选示例（§8.4）。
+### 8.5 【v2 增补】runbook 修订点（实现卡内完成，登记备查）
 
-### 8.3 版本与依赖
-
-- 版本 **0.2.0**（minor：新增用户可见表面+一处缺省值变更，无移除）。
-- 新依赖：`toml = "0.8"` + `serde`（derive）入 `otp-cli`（workspace 无 TOML 解析器；手写解析器=bug 温床，否决；JSON 无注释不适合手运维文件，否决——见 §5 取舍）。实现卡须过 `cargo-deny`（deny.toml）复核新依赖树（toml 系纯 Rust、cargo 自身同源，预期无 advisories）。
-- CODEOWNERS 影响：改动集中于 `crates/otp-cli`，不触协议/allocator/recovery/session 仓段。
-
-### 8.4 文档与帮助面增补（实现卡内完成）
-
-1. `--help` 首行用法串改为 `jbuu [选项] <主机|别名> / jbuu <子命令>`，Usage 示例首条=芥末命令①原文；
-2. runbook §0.2：`SRV_PORT` 注释更新为"产品默认 7717（不设即用默认）"；§5.3 增直连与别名两例（原 connect 例保留）；新增 §5.5 客户端 config.toml 初始化（示例文件 + 0600 + `doctor --config`）；
-3. README 快速开始改两行（serve 默认端口说明 + 直连一行）；
-4. 仓内附 `docs/examples/jbuu-config.toml`（§5.2 同款注释版）。
+1. §0.1 铁律改写：mesh-only 条款删除，换"7717 公网直达=一等形态；mesh/私网=子集"（§9.2 三形态表照搬）；密码本传递条款保留原意（公网链路上传密码本仍禁止，走既有加密通道/物理介质——**待门神复核**是否有新要求，§13）；
+2. §3.2 nft 保险带更新（§9.5 新规则照抄）；
+3. §3.3 systemd 单元：主推示例改 `--listen [::]:7717`（公网一等），mesh 子集示例降为附注；
+4. 新增 §x：端口共存网关说明（§10 摘要版：ssh 兼容入口、提醒通道、审计行格式）；
+5. 帮助面/README/`docs/examples/jbuu-config.toml` 同 v1 §8.4 增补项 + user/-c 示例各一。
 
 ---
 
-## 9. ⑥ 与 doorkeeper（jbuu-doorkeeper）的部署视角配合
+## 9. 【v2 整节重写】部署形态与端口职责边界
 
-### 9.1 端口拓扑（目标态一张图）
+> 【v2 修订】依据：芥末 09-15 ③（公网直达=一等）；替代 v1 §9 全节，**v1 §9.3"mesh-only 原样继承"整段作废**；runbook §0.1 铁律随之作废（§8.5 修订项 1）。
+
+### 9.1 目标态拓扑（公网 7717/22 + 内网 2222 完整拓扑）
 
 ```
-公网 ──:22──> doorkeeper ──> 127.0.0.1:2222 sshd        （SSH 过渡垫，wp14，有日落）
-mesh ──:7717─> jbuu serve（MESH_IP:7717）                （锦书服务面，常驻）
-客户端：~/.config/jbuu/config.toml（别名/密码书路径）      （纯客户端制品）
+                       ┌─────────────────────────── 单宿主服务器 ───────────────────────────┐
+                       │                                                                    │
+                       │  ┌──────────────────────────────┐        ┌───────────────────┐     │
+  公网 jbuu 客户端      │  │ :7717  jbuu serve            │        │ 密码本/双锚 0600   │     │
+ ──────────────────────┼─►│ （一等入口；内置端口共存网关）│◄──────►│ （仅 HELLO 路径）  │     │
+  （芥末③：公网直达）   │  │  嗅探分流（全时，§10）        │        └───────────────────┘     │
+                       │  │   ├ 首包 "SSH-…" ────────────┼──┐                               │
+  公网 ssh 兼容客户端   │  │   │    审计+提醒行+透传      │  │   ┌───────────────────┐       │
+ ──────────────────────┼─►│   │                          │  └─► │ sshd              │       │
+  （ssh -p 7717 / 扫描）│  │   ├ 首包 00 02 00 01 …      │      │ （wp14 D10 收缩）  │       │
+                       │  │   │    → jbuu 正常握手       │ ┌──► │ 127.0.0.1:2222    │       │
+  mesh VPN 客户端       │  │   └ 其余/超时 → 关闭+审计    │ │    │ [::1]:2222        │       │
+ ──────────────────────┼─►│ MESH_IP:7717（子集形态，      │ │    │ 仅回环监听        │       │
+  （子集=同一进程）      │  │            同一 serve 同一网关）│ │    └────────▲──────────┘       │
+                       │  └──────────────────────────────┘ │             │                  │
+                       │  ┌──────────────────────────────┐ │             │                  │
+                       │  │ :22  jbuu-doorkeeper          │─┴─────────────┘                  │
+  公网存量 SSH 客户端   │  │ （wp14 过渡垫：警告行+零识别   │      警告行+双向透传               │
+ ──────────────────────┼─►│   透传；有日落 §7.7）          │    （与 7717 网关共用同一 sshd）   │
+                       │  └──────────────────────────────┘                                  │
+                       │   nft 保险带：2222 仅 iif "lo"（既有；两入口均走 lo，合规）          │
+                       └────────────────────────────────────────────────────────────────────┘
 ```
 
-- 7717 与门卫三端口（22/2222/2223）零重叠（runbook §0.2 既有避让注释正是为此）；nft 保险带（runbook §3.2）白名单从 `SRV_PORT` 变量改为默认值后照抄成立。
-- **边界重申**：config.toml 只被**发起连接的 jbuu 进程**读取；serve 不读（服务端无别名概念）、doorkeeper 不读（门卫不做协议判定，wp14 安全边界声明）。别名机制不改变任何服务端/门卫行为。
+要点：**22 与 7717 是两个独立公网入口，汇聚到同一个回环 sshd 2222**；7717 同时是 jbuu 主服务面（一等入口）与 ssh 兼容入口；mesh 子集形态不引入第二个进程。
 
-### 9.2 SSH→锦书的别名迁移对照（运维视角，芥末②的落地动作）
+### 9.2 部署形态矩阵（一等与子集）
+
+| 形态 | 监听 | 客户端路径 | v2 地位 |
+|---|---|---|---|
+| **F1 公网一等** | `serve --listen [::]:7717` | 公网直达 jbuu；`ssh -p 7717` 兼容链路亦通（§10.3） | **主推**（runbook 首例、文档默认叙事） |
+| F2 mesh 子集 | `serve --listen MESH_IP:7717` | 仅 mesh 内直达 | 原样保留（v1 站点零迁移）；同一二进制/同一网关行为，仅监听地址与防火墙口径不同 |
+| F3 回环冒烟 | 缺省 `127.0.0.1:7717` | 本机 | 开发/测试/默认缺省（安全缺省不暴露） |
+
+F2 是 F1 的**网络子集**：代码路径、网关分流、CLI 行为完全一致；F2 下 fallback 探测 22 若 mesh 内无 ssh 入口则自然报"22 不可达"（§11.2），不产生新失败模式。
+
+### 9.3 端口职责边界表（任务卡⑤"两端口职责一张图"的表形态）
+
+| 端口 | 监听者 | 暴露范围 | 职责 | 生命周期 |
+|---|---|---|---|---|
+| **22/tcp** | jbuu-doorkeeper（wp14） | 公网 | SSH 过渡垫：警告行+零识别透传→2222；迁移仪表盘数据源 | **有日落**（wp14 §7.7：连续 4 周 <5 次/周且零自动化客户端） |
+| **7717/tcp** | jbuu serve（内置网关，§10） | 公网（一等）/mesh（子集） | jbuu 主服务面（HELLO→握手）＋ ssh 兼容转发（审计+提醒+透传→2222）＋ 第三协议拒绝 | **常驻**（锦书本体的入口，无日落概念） |
+| **2222/tcp** | sshd（wp14 D10 收缩） | 仅回环 `127.0.0.1`+`[::1]` | 被两个公网入口共用：22（doorkeeper）与 7717（网关）；sshd 认证/MaxStartups 保护不变 | 随 SSH 整体日落评估（§9.6） |
+
+职责一句话：**22 管"存量 SSH 客户端的习惯端口"，7717 管"锦书的一等入口+顺带的 ssh 兼容"，2222 是两者共享的 sshd 回环落点**。两入口互为备份但互不依赖：停 doorkeeper 不影响 7717；网关 `--ssh-forward off` 不影响 22。
+
+### 9.4 与 doorkeeper 的关系重理（v1 §9.1/§9.2 部分继承，§9.3 作废）
+
+- **继承**（v1 §9.2）：SSH→锦书别名迁移对照、过渡期两文件并存、运维切换五步、config.toml 仅客户端读取且 serve/doorkeeper 不读——全部有效；v2 仅把示例 host 从 mesh 地址放宽为公网/mesh 均可（§9.2 形态表）。
+- **重理**（新增）：7717 网关的 ssh 转发目标=sshd 回环 2222，**不经 doorkeeper**（直连 sshd 落点，少一跳、少一个单点）；doorkeeper 的仪表盘职责由网关审计行**同源补位**（§10.3 审计事件 schema 与 doorkeeper 日志字段对齐，仪表盘聚合两条入口）。
+- **作废**：v1 §9.3"不存在经 doorkeeper 中转 jbuu 会话的形态"一句中"mesh-only 铁律原样继承/公网地址属违规配置"的断言整体作废——v2 公网地址是一等合法配置；"jbuu 会话不经 doorkeeper"本身仍成立（网关直连 2222 的只是 ssh 兼容流量，jbuu 流量根本不出进程）。
+
+### 9.5 防火墙保险带更新（runbook §3.2 的 v2 替换规则）
+
+```sh
+# 7717：公网开放（一等形态；mesh 子集站点把 any 换回 $MESH_CIDR 即回到 v1 口径）
+nft add rule inet jbuu input tcp dport 7717 accept
+# 2222：仅回环（wp14 既有规则原样——22 垫片与 7717 网关两路径都走 lo，天然合规，无需改）
+nft add rule inet jbuu input tcp dport 2222 iif != "lo" drop
+```
+
+### 9.6 日落联动
+
+doorkeeper 日落判据（wp14 §7.7）不变，但其仪表盘从 22 单入口变为 22+7717 双入口聚合（§10.3）；SSH 彻底日落、sshd 2222 关停后：网关 ssh 路径 connect 上游失败→fail closed 关闭+审计（G10），jbuu 路径不受影响；届时可 `--ssh-forward off` 收面。终态（是否保留 sshd）不在本卡。
+
+---
+
+## 10. 【v2 新增】端口共存网关（7717 单口多协议）
+
+> 【v2 新增】依据：任务卡修订范围②+芥末 09-15 ③；无 v1 对应节（v1 §4.1"避开 22/2222/2223"仍成立——网关不占新端口）；与 wp14 定案 1（零识别透传）、W1–W6 警告行不变式复用。
+
+### 10.1 定位与进程归属（裁决 D18）
+
+**网关内置于 `otp-cli serve` 进程**，监听 7717 的 accept 循环前置一段"嗅探分流"，非独立二进制。理由：
+- 7717 无特权端口问题（wp14 独立进程的两条理由——`CAP_NET_BIND_SERVICE` 剖面隔离与"停一个 unit 即日落"——均不适用：7717>1024 无需特权；网关是**常驻**能力非过渡垫，无日落故事）；
+- jbuu 路径"分流后原地进握手"零跨进程开销（独立网关则 serve 还要再监听一个回环口、多一跳与一个 unit，三人团队过设计）；
+- 隔离诉求改由**纪律**满足：分流段代码只做"读首包/判首字节/回放/转发"，不触碰密码本/锚/会话状态（§10.2 最小面约束+G 组用例锁死）。
+
+### 10.2 首包判别规则（裁决 D19；伪代码为验收件）
+
+判别依据（事实链）：SSH 客户端在 TCP 连接建立后**立即**发送 ASCII 标识串，行首恒为 `"SSH-"`（RFC 4253 §4.2；wp14 E1/E3 实证 OpenSSH 10.0 与扫描器行为）；jbuu 公共帧头首 2 字节为 `version`（u16 大端，恒 `0x0002`，wp01 §4.1/向量 HELLO-NEG-001），**首字节恒 `0x00`**；两族魔数首字节（`0x53` vs `0x00`）无碰撞，**一个字节即可分族**；后续校验（`00 02|00 01|0000002C`、52B 定长、0x0301/0x0302/0x0305 错误码）**全部委托既有 codec**，嗅探层不复制任何协议知识。version 将来升 0x0003…（高字节仍 0x00）判别不破。
 
 ```text
-# ~/.ssh/config（迁移前）              # ~/.config/jbuu/config.toml（迁移后）
-Host ops                               [alias.ops]
-  HostName 192.0.2.10                 host  = "192.0.2.10"
-  Port 22                                port  = 7717
-  User ops                #→无对应       book  = "~/jbuu-cli/otp.book"
-  IdentityFile ~/.ssh/id_ed25519  #→book（密钥位改密码书位）
+# ── 常量（默认值均旗标可调，D20）──────────────────────────────
+SSH_MAGIC          = b"SSH-"        # RFC 4253 §4.2 标识串魔数（ASCII）
+JBUU_BYTE0         = 0x00           # jbuu 公共帧头 version 高字节（u16 大端恒 0x00xx）
+SNIFF_WINDOW_SECS  = 10             # 嗅探总窗口：自 accept 起算，一次设死（非逐读顺延）
+SNIFF_MAX_CONNS    = 64             # 分类期并发上限（超限 accept 即关）
+SNIFF_READ_CAP     = 256            # 首包读入上限（仅判别与回放用）
+
+procedure sniff_dispatch(conn):
+    if 分类期连接数 >= SNIFF_MAX_CONNS:              # G8
+        close(conn); audit(event=sniff_overflow, src); return
+    set_read_deadline(conn, accept_ts + SNIFF_WINDOW_SECS)   # ★总窗口制：逐字节拖流也会在窗口尽时被杀（G5）
+    buf = read(conn, min=1, max=SNIFF_READ_CAP)      # 阻塞至≥1字节或 deadline
+    switch 结果:
+      case 超时:  close(conn); audit(event=sniff_timeout, src); return          # 边界①：窗口内零字节/不满判别量（G4）
+      case EOF:   close(conn); audit(event=sniff_eof,    src); return          # 边界①：连接即断
+      case ok:
+          b0 = buf[0]
+          if b0 == 'S' (0x53):
+              if len(buf) < 4: buf += read_more(补满4B, 同一 deadline)          # "SSH" 后停发 → 继续等，窗口兜底
+                  超时/EOF → 同 case 超时/EOF
+              if buf[0..4] == SSH_MAGIC:  ssh_path(conn, buf)                  # → §10.3
+              else:                       third_protocol(conn, buf)            # 边界③：'S' 开头但非 "SSH-"（G7）
+          elif b0 == JBUU_BYTE0 (0x00):
+              clear_read_deadline(conn)
+              jbuu_handshake(conn, replay=buf)        # → §10.4：回放已读字节，余下校验全归 codec
+          else:
+              third_protocol(conn, buf)               # 边界③：HTTP "GET "/"POST"、TLS 0x16、telnet…（G6）
+
+procedure ssh_path(conn, buf):
+    audit(event=ssh_forward, src=conn.src_addr, first_bytes=hex(buf[:16]))     # 审计记录（提醒通道②，§10.3）
+    write(conn, WARN_LINE_FROZEN)                    # 预写提醒行：wp14 §3.1 冻结常量逐字节复用（101B，md5 aecf…） 
+    if not SSH_FORWARD_ENABLED: close(conn); return                           # --ssh-forward off：与第三协议同待遇
+    up = connect(SSH_UPSTREAM /* 仅回环，启动时校验，D22 */, timeout=5s)        # 与 wp14 上游超时对齐
+    if 失败: close(conn); audit(event=ssh_upstream_fail, src); return          # fail closed（G10）
+    双向透传（buf 先行回放上游；此后不改写/不缓存判定/不注入任何字节）          # wp14 定案 1 同款零识别 pipe
+
+procedure third_protocol(conn, buf):
+    audit(event=third_protocol, src=conn.src_addr, first_bytes=hex(buf[:16]))
+    close(conn)                                      # 不转发、不回应、不猜测协议（D23）
 ```
 
-过渡期两文件并存（ssh 别名指向 :22 门卫链路，jbuu 别名指向 mesh :7717），互不干扰；门卫日志（wp14 §7.10 仪表盘）仍是 SSH 流量日落的唯一判据，jbuu 别名推广不参与、不阻塞该判据。运维者从 `ssh ops` 切到 `jbuu ops` 的最小步骤：拿件（book 副本+book_id，runbook §5.1）→ 初始化双锚+同目录摆放（§5.2/§6.3）→ 写 config.toml（0600）→ `jbuu doctor --book …` → `jbuu ops`。
+三条边界（验收要求）在伪代码中的落点：**空首包**（零字节至窗口尽/即断）→ `sniff_timeout`/`sniff_eof` 关闭+审计；**超时**（slowloris 逐字节）→ 总窗口制兜底 `sniff_timeout`；**第三协议**（非 SSH 非 HELLO，含 'S' 开头非 "SSH-"）→ `third_protocol` 关闭+审计，绝不猜测转发。
 
-### 9.3 直连语义对门卫链路的无交集声明
+### 10.3 ssh 路径：审计 + 提醒通道（设计定夺）+ 转发
 
-直连/别名只走 mesh 直达 serve，**不存在**"经 doorkeeper 中转 jbuu 会话"的形态（门卫是 SSH 垫，非通用转发器；锦书流量过门卫既无必要也未被 wp14 覆盖）。本设计不新增任何公网暴露路径，mesh-only 铁律（runbook §0.1）原样继承：别名文件里的 host 应为 mesh 地址，公网地址+公网端口映射仍属站点违规配置，doctor/代码不放松（与 v0.1 同口径：代码不强制、runbook 纪律+nft 保险带兜底）。
+提醒通道四选项定夺（任务卡授权"你在设计中定夺并给理由"）：
+
+| 通道 | 定夺 | 理由 |
+|---|---|---|
+| **审计日志行（主通道）** | ✅ 采用 | 唯一可靠通道：无人值守会话/扫描器本来就没有人眼；事件入既有 `--audit-log` JSONL（serve 既有旗标，零新文件面）；字段与 doorkeeper 日志对齐（`event/src/first_bytes/ts`），迁移仪表盘双入口聚合（§9.6） |
+| **预写 SSH 预版本行（尽力通道）** | ✅ 采用 | 复用 wp14 §3.1 冻结常量（101B golden，md5 `aecf98908984d17e97343cafb25dfa59`）与 W1–W6 校验：机制安全性已被 wp14 E1（OpenSSH 10.0 完整走通）/E3（30 并发逐字节校验）实证；对 PuTTY 类显示型客户端有真实触达；对 jbuu 路径**零写入**（G11 锁死） |
+| **stderr** | ⚠️ 仅前台排障，不承担提醒 | 服务端 stderr 客户端永远看不见；提醒对象（ssh 用户/运维）不在 serve 的终端前 |
+| **事件钩子** | ❌ 否决 | 团队无事件消费者（YAGNI）；若门神复核后需要（§13），另开卡加，接口不预埋 |
+
+**人眼触达的真正主承重=sshd 自身 `Banner`（部署件）**：wp14 E2 实证 OpenSSH 客户端对前置行**默认不可见**（仅 `-v` debug 级显示）；wp14 §3.6 已定可见性主通道=sshd `Banner` 配置。7717 网关与 22 垫片**共用同一 sshd 2222**，同一 Banner 自动覆盖两入口——网关侧零新代码获得认证阶段原生显示。此为"预写行仅尽力"的完整闭环。
+
+### 10.4 jbuu 路径
+
+首字节 `0x00` → **清除嗅探 deadline**，已读字节回放给既有握手读循环，进入 WP-02 状态机：HELLO 52B 定长/版本/类型/payload_len 校验、ARBITRATE 仲裁、fail-to-waste 规则**一字不改**。嗅探层对 jbuu 路径的全部影响=多读了一次 ≤256B 并回放（G11 断言零额外写入）。畸形 jbuu 首包（`0x00` 后乱字节）走 codec 既有错误码（0x0301/0x0302/0x0305）与关闭路径——**嗅探层不新增任何协议错误分支**。
+
+### 10.5 第三协议、空首包与超时（行为表）
+
+| 场景 | 行为 | 审计事件 |
+|---|---|---|
+| 零字节挂连（扫描器半开/静默） | 窗口尽→关闭 | `sniff_timeout` |
+| 建连即断 | 关闭 | `sniff_eof` |
+| 逐字节慢发（slowloris） | 总窗口 10s 兜底→关闭 | `sniff_timeout` |
+| `"GET / HTTP/1.1\r\n"`、TLS ClientHello(0x16)、任意非两族首字节 | 关闭，不回应 | `third_protocol` |
+| `"S…"` 非 `"SSH-"`（如 `"SFTP\n"`） | 关闭 | `third_protocol` |
+| `"SSH-"` 后半途 EOF | 关闭 | `sniff_eof` |
+| 上游 2222 不可达（如 SSH 已日落） | 客户端侧关闭，fail closed | `ssh_upstream_fail` |
+| 分类期并发超限 | accept 即关，不排队 | `sniff_overflow` |
+
+已知局限（登记，非缺陷）：极少数"等服务器先发 banner"的非主流 SSH 实现会挂到窗口超时被关（RFC 4253 要求双方立即发送，主流实现均先发；wp14 E 系列未见此类）。**待门神复核**（§13.4）。
+
+### 10.6 嗅探层攻击面专节（任务卡点名单独成节；结论全部**待门神复核**）
+
+| 攻击面 | 缓解设计 | 残余风险 |
+|---|---|---|
+| 连接洪泛/资源耗尽 | 分类期并发上限 64（超限即关不排队）；总窗口 10s 使每连接滞留≤10s；jbuu/ssh 会话期资源沿用既有 `--sessions`/sshd MaxStartups（wp14 §5.1 同款"不重复限流"结论） | 64×10s 的瞬时 socket/任务占用量级 |
+| slowloris 拖字节 | **总窗口制**（自 accept 起算一次设死，非逐读顺延）——逐字节拖流最多存活一个窗口 | 无（设计性消灭） |
+| 畸形首包 | `0x00` 族全权委托 codec（既有 0x0301/0x0302/0x0305 路径，零新增解析面）；读上限 256B 防超长首包占内存 | 无新增 |
+| 判别歧义（先发一族魔数再切换另一族） | 分流**一次性单向 commit**：判读字节已入 buf 并原样回放目标路径，无"重判"分支；两路径均 fail closed | 无 |
+| 开放代理/反弹滥用 | `--ssh-upstream` **仅允许回环地址**（启动时校验，非回环拒绝启动，D22）；网关不可能成为对外跳板；2222 的 nft `iif != lo drop` 保险带（wp14）双保险 | 无 |
+| sshd 认证面二次暴露（经 7717 的爆破） | sshd 侧 MaxStartups/MaxAuthTries/fail2ban 照常生效（同一 sshd 2222）；网关不代行认证 | 双入口爆破流量叠加 → **待门神复核** |
+| 审计洪泛（打爆磁盘） | 每事件一行、`first_bytes` 截 16B hex；审计写入失败时 fail closed（拒绝新连接，保审计完整性） | 拒服代价 vs 审计完整性取舍 → **待门神复核** |
+| 预写行攻击面 | 复用 wp14 冻结常量+W1–W6 校验（自定义行同校验）；jbuu 路径零写入（G11） | 无新增（wp14 已证） |
+| 提醒行触达率 | wp14 E2：OpenSSH 默认不可见；主承重=sshd Banner（§10.3） | 触达率依赖 Banner 部署纪律 → **待门神复核** |
+
+### 10.7 网关旗标面（serve 新增四个，登记于 §2）
+
+| 旗标 | 缺省 | 语义 |
+|---|---|---|
+| `--ssh-upstream <addr>` | `127.0.0.1:2222` | ssh 路径转发目标；**仅回环**（127.0.0.1/::1，含端口任意），非回环拒绝启动（D22） |
+| `--ssh-forward on\|off` | `on` | off=纯 jbuu 口：ssh 族按第三协议处理（关闭+审计，`event=ssh_forward_disabled`） |
+| `--sniff-timeout-secs <u16>` | 10（钳 1..60） | 嗅探总窗口 |
+| `--sniff-max-conns <u32>` | 64（钳 1..1024） | 分类期并发上限 |
 
 ---
 
-## 10. 错误面与退出码登记（新增行）
+## 11. 【v2 新增】c 侧 ssh fallback 与 `user@` 语法
+
+> 【v2 新增】依据：任务卡修订范围③+芥末 09-15 ③；替代 v1 §3.4"无 user@ 前缀"条款与 §3.6/§5.4 对应行。
+
+### 11.1 fallback 触发规则（裁决 D24）
+
+同时满足以下四条才触发（缺一即按原始错误正常退出）：
+
+1. 解析出的目标端口 == `DEFAULT_JBUU_PORT`（=7717）——**用户显式给端口（`host:port`/`-p`/别名 port）则禁用**（显式端口=刻意指定服务，静默换 22 违最小惊讶）；
+2. 对 7717 的失败是**传输层连接失败**（refused/超时/不可达）——**协议层错误绝不 fallback**（握手失败/BOOK_MISMATCH/段耗尽是配对问题，fallback 会掩盖错误并延迟暴露，fail closed）；
+3. 未给 `--no-ssh-fallback`；
+4. PATH 上存在可执行 `ssh`（不存在则跳过探测，按原始错误退出）。
+
+### 11.2 探测与 exec（裁决 D25）
+
+- 探测：TCP connect `host:22`，deadline **3s**（旗标不可调——避免配置面蔓延；值本身提请芥末拍板 D25）。
+- 成功 → `execvp("ssh", …)` **替换本进程**（非子进程等待转发——退出码/信号/TTY 归属天然正确）：参数 `ssh [-p 22] [user@]host [command]`（user 取值序见 §6.1 附注；command 仅当 `-c` 给出，§12.3）。执行前 stderr 打一行：`7717 连接失败（<原因>），已回落 ssh :22`（可感知、可 grep）。
+- 失败（22 也拒/超时）→ stderr 报**原始 7717 错误** + 附注"（已探测 :22 亦不可达：<原因>）"，exit 1（沿用连接失败口径，§14）。
+- fallback 后一切（认证、密钥、KnownHosts、退出码）归 ssh 与其自身配置；jbuu 的 book/锚/deadline/审计旗标**不参与** fallback 路径。
+
+### 11.3 `user@` 文法与语义（裁决 D26；文法见 §3.4，矩阵行见 §3.2）
+
+- jbuu 协议无用户概念（身份=book_id，握手内核对）——**直连 jbuu 时 user 不参与协议**，解析成功且 jbuu 连接建立时 stderr 恰一行提示：`user "ops" 不参与 jbuu 直连（身份=密码本 book_id）；仅在回落 ssh 时使用`（R5，不静默吞掉以免用户误以为起了作用）；
+- **仅 fallback 时透传**：构造 ssh 命令行 `user@host`；无 user 则 ssh 用本机用户名（ssh 缺省）；
+- 与 v1 论据的关系：v1"不做 user@"的理由（协议无用户）依然成立且被尊重——user 从来不是 jbuu 参数，只是 ssh 兼容链路的透传件；变化在于 09-15 之后"22 是公网一等可达的 ssh 链路"成为事实，透传有了真实消费方。
+
+### 11.4 别名 `user` 字段
+
+§5.2 增 `user`（可选）：`jbuu ops`（别名 ops 含 `user="deploy"`）fallback 时 → `ssh deploy@host`；CLI `root@ops` 覆盖之（§6.1 附注取值序）。直连成功时与 CLI user@ 同样只提示不使用。
+
+---
+
+## 12. 【v2 新增】`-c '<command>'` 非交互执行形态
+
+> 【v2 新增】依据：任务卡修订范围④+芥末 09-15 ④（"agent/脚本场景是真实用户"，v1 只做交互 PTY 是缺口）；v1 §2 逃生门交互由 §12.2 明确；无 v1 对应节。
+
+### 12.1 语义与 PTY 复用（裁决 D27）
+
+`jbuu <host|别名> -c '<command>'`（ssh 的 `ssh host 'cmd'` 同款语义位；注意 ssh 客户端的 `-c` 是 cipher 选择，锦书算法冻结无 cipher 面，此处 `-c` 即 command，登记防混用）：
+
+1. 会话建立与交互形态**完全同路**：doctor/自加固 → 握手/仲裁 → 段签发 → 附着（`run_connect` 既有路径，无旁路）；
+2. 服务端不 spawn 登录 shell，改 spawn **`<serve --shell 旗标指定的 shell> -c '<command>'` 并挂 PTY**——WP-16 的 lease/心跳/回收/退出码回传全链**零改动复用**；
+3. 客户端把 PTY 输出流式转发本进程 stdout；命令结束：服务端 waitpid 取退出码 → 既有退出码回传通道 → 客户端以该码退出（`jbuu host -c 'exit 7'` → 本地 exit 7，E6）。
+
+**PTY 附着（vs 管道）的取舍**：任务卡④原文即"附着 PTY→执行→回显→退出码回传"；工程上复用 WP-16 PTY 机制=零新会话类型、零协议面（WP-16 冻结不触）。代价如实声明三条（R6）：① **stdout/stderr 合流**+CRLF 行尾（PTY 单流必然，等价 `ssh -t`；需分离流的场景用交互形态+管道）；② `deadline_secs` 只覆盖握手+附着（同 v1 口径），命令时长不限（同交互会话）；③ 命令在远端 PTY 环境下运行（`isatty`=true、作业控制存在），与无终端 cron 环境行为可能有差——脚本作者须知。
+
+### 12.2 与 `--` 逃生门的交互（矩阵明确，T14/T15）
+
+- `--` 的语义收窄声明：**`--` 之后只收 host 一个位置参数**。`jbuu -- serve` → host="serve"（v1 行不变）；`jbuu -- serve -c 'x'` → exit 2（"-c" 落为第二个位置参数，触犯"直连只收一个位置参数"）。
+- 影响面：主机名恰为七个子命令词**且**需要 `-c` 的组合没有合法写法——登记为逃生门边角（逃生门本就是应急件，`--config` 等旗标仍可前置：`jbuu --config X -- serve` 合法）。
+- 其余 `-c` 位形：可前置于 host（`jbuu -c 'w' host`）；与 `-p`/内嵌端口/`--no-ssh-fallback` 任意组合；缺值→clap 错误 exit 2；第二位置参数命令形态（`jbuu host 'cmd'`）**拒绝**（§3.6，-c 是唯一命令门）。
+
+### 12.3 与 fallback 组合
+
+`-c` 给出且触发 fallback（§11.1 四条）→ `ssh [-p 22] user@host '<command>'`：ssh 对命令参数本就不分配 PTY（与 jbuu 路径"总是 PTY"不同，见 12.1 声明③的差异）、退出码直传——两条链路退出码语义一致（远端命令码），输出形态差异（合流 vs 分离）登记于 §12.1。此组合正是 agent/脚本场景（芥末④）的兜底路径：7717 挂了，同一条 `jbuu host -c '…'` 命令仍能经 22 拿到结果与退出码。
+
+### 12.4 复用与不触碰声明
+
+WP-16（PTY/lease/恢复）冻结面零触碰（只换 spawn 目标：登录 shell → `shell -c cmd`）；WP-01/02/03 协议零触碰；`--recover`/审计/`--allow-unencrypted-swap` 对 `-c` 会话语义照旧（恢复的是会话不是本地命令行——`-c` 会话断线后 `--recover` 恢复的是远端 PTY，命令已死则随即收到退出码，行为自洽，登记不展开）。
+
+---
+
+## 13. 【v2 新增】威胁建模联动（结论全部标注：**待门神复核**）
+
+> 【v2 新增】依据：任务卡修订范围⑥；门神卡调度侧另行安排，不在本卡——本节只汇总暴露面变化与移交清单。
+
+| # | 暴露面变化 | 设计自评 | 移交门神 |
+|---|---|---|---|
+| 13.1 | **7717 从"mesh 内口"变"公网口"**：公网扫描/噪声直达 serve 进程 | 嗅探层限额（§10.6）；jbuu 握手自身安全性不依赖网络位置（OTP book 认证、fail-to-waste：错误 book_id → BOOK_MISMATCH 关闭不耗段，WP-01）；审计量上升（每事件一行） | 噪声量级与审计容量预估 |
+| 13.2 | **sshd 认证面经 7717 二次暴露**（公网爆破多一条入口） | sshd MaxStartups/MaxAuthTries 照常生效（§10.6）；fail2ban 是否需要把 7717 流量计入 → 运维侧 | 双入口爆破叠加的策略建议 |
+| 13.3 | **嗅探层新增攻击面**（slowloris/畸形包/窗口滞留/开放代理） | §10.6 逐条缓解（总窗口/并发上限/单向 commit/仅回环 upstream/读上限 256B） | 复核缓解充分性与限额缺省值（64/10s/3s/5s） |
+| 13.4 | **提醒通道触达率**与"等服务器先说话"的 SSH 实现兼容性 | 预写行仅尽力（wp14 E2 实证）；Banner 主承重（§10.3）；非主流实现挂窗口超时被关（§10.5 局限登记） | 触达策略与窗口值终裁（联动 D20/D21） |
+| 13.5 | **密码本/锚传递纪律**（公网一等后"拿件"路径） | runbook 既有"永不明文过公网"条款保留（§8.5.1） | 是否需要新传递规程 |
+
+---
+
+## 14. 错误面与退出码登记（v1 §10 全保留 + v2 增行）
+
+v1 十行全部有效。新增：
 
 | 触发 | 消息要点（stderr 一行） | 退出码 |
 |---|---|---|
-| 裸 `jbuu` | 简短帮助 | 2 |
-| 直连旗标给了但缺 `<host>` | "缺少 <host>；直连用法见 --help" | 2 |
-| 双端口来源冲突（`host:port` + `-p` 不等） | 两值并列回显 | 2 |
-| token 既非地址也非已知别名 | "未知别名/地址 X（配置：<路径>；--help 看初始化示例）" | 2 |
-| 配置文件存在但解析失败 | TOML 行列号+未知字段名 | 2 |
-| 别名校验违规（§5.3） | 点名别名与违规项 | 2 |
-| 别名/直连缺 book | "未配置 book：别名 X 未给 book 字段且未传 --book" | 2 |
-| 同目录锚缺失 | 两个期望路径 + `--anchor-a/-b` 用法 | 2 |
-| 其余（连接失败/doctor BLOCK/远端退出码） | **复用现状 connect 口径** | 1/2/N |
-
-新增错误一律发生在"连接发起前"（纯本地解析），不触碰既有运行期错误分类。
+| `user@` 空 user（`@host`） | "user 为空" | 2 |
+| `--` 之后多位置参数（`-- serve -c 'x'`） | "-- 之后只收 <host>；如需旗标请置于 -- 之前" | 2 |
+| fallback 探测成功 | "7717 连接失败（原因），已回落 ssh :22"（信息行，非错误） | ssh 退出码 |
+| fallback 22 亦不可达 | 原始 7717 错误 + "（已探测 :22 亦不可达：原因）" | 1 |
+| user@ 直连成功提示 | "user X 不参与 jbuu 直连…"（信息行） | — |
+| 网关侧事件（sniff_timeout/third_protocol/ssh_upstream_fail/sniff_overflow…） | 进 `--audit-log` JSONL，不占 stderr | —（连接侧关闭） |
 
 ---
 
-## 11. 测试清单（实现卡直接转用例）
+## 15. 测试清单（v1 T/P/C/E 四组全保留；v2 增 T13–T16、G/F 组、E6–E9）
 
-**T 组（解析矩阵单测，`try_parse_from`）**：T1 `jbuu`→help+2；T2 直连最小式（芥末命令①的解析等价）；T3 `host:port`；T4 IPv6 裸/方括号两形态；T5 别名命中；T6 `-p` 与内嵌端口冲突→2；T7 缺 host 带旗标→2；T8 双位置参数→2；T9 `--` 逃生门；T10 大小写（`Serve`→别名/地址路径，非子命令）；T11 顶层旗标+子命令不串层；T12 既有 `command_surface_parses` 全绿零改动（回归锚）。
-
-**P 组（优先级/捆绑单测）**：P1 旗标>别名；P2 内嵌>别名 port；P3 别名>常量 7717；P4 凭据捆绑三例（§6.2 三行场景）；P5 同目录锚命中；P6 锚缺失报错文案含双路径；P7 `--recover` 只在旗标层；P8 别名不给 book 且无 `--book`→2。
-
-**C 组（config 解析单测）**：C1 坏 TOML 行列号；C2 未知字段拒绝；C3 同名别名重复拒绝；C4 别名违规三规则逐条；C5 `~` 展开与前导字面 `~`；C6 文件不存在=空表；C7 `--config` 覆盖发现路径；C8 0600 权限 warn（P2）。
-
-**E 组（e2e，loopback）**：E1 serve `:0`+`jbuu 127.0.0.1 -p $port --book`（读 LISTEN= 取端口，避免并发抢占默认端口）；E2 **芥末命令①端到端**：serve 默认 `--listen`（127.0.0.1:7717）+ 同目录三件套摆放 + `jbuu 127.0.0.1 --book b` 连通拿到 shell 退出码（7717 被占则 skip 并标注，CI 串行段跑）；E3 别名端到端（`--config` 指 tempdir，覆盖旗标/捆绑各一例）；E4 未知别名/缺锚两条错误路径 exit 2；E5 runbook §5.3 旧 connect 命令照抄回归（零破坏验收）。
+**T 组增补**：T13 `user@` 解析四例（普通/主机名/IPv6 方括号/空 user→2）；T14 `-c` 解析四例（host 后/host 前/缺值→2/与 `-p` 组合）；T15 `jbuu -- serve -c 'x'`→2（-- 后仅收 host）；T16 `--no-ssh-fallback` 登记解析+别名 user 字段命中。
+**P 组/C 组**：v1 全保留（P/C 行为零变化——user/-c 不入优先级阶梯与 config 校验仅增 `user` 字段一条 C 用例）。
+**G 组（网关，loopback 假 sshd=nc/python 脚本）**：G1 `"SSH-2.0-x\r\n"`→上游收到原样首包+客户端先收警告行逐字节断言（golden md5）；G2 HELLO→正常握手（**既有 e2e 不改全绿=回归锚**）；G3 首字节 `0x00`+畸形帧→codec 错误码原样（0x0301/0x0302/0x0305）；G4 零字节连接→窗口超时关闭+审计行存在；G5 slowloris 逐字节（每字节间隔<窗口）→总窗口兜底被杀+审计；G6 `"GET / HTTP/1.1\r\n"`→关闭+`third_protocol` 审计；G7 `"SFTP\n"`（'S' 非 "SSH-"）→同 G6；G8 并发超限→accept 即关+`sniff_overflow`；G9 `--ssh-upstream 10.0.0.1:22`→拒绝启动；G10 上游无监听→客户端关闭+`ssh_upstream_fail`，jbuu 路径不受影响；G11 jbuu 路径零写入断言（嗅探不向 HELLO 客户端写任何字节）；G12 `--ssh-forward off`→ssh 族按第三协议处理。
+**F 组（fallback，假 22 监听+PATH 注入 stub ssh）**：F1 7717 拒连+22 通→exec 参数断言（`user@host`/`-p 22`/命令透传）；F2 双拒→exit 1 且消息含原始错误；F3 显式端口 7790 拒连→不探测直报错；F4 `--no-ssh-fallback`→不探测；F5 22 黑洞→3s 探测超时→exit 1；F6 别名 `user` 字段透传；F7 `user@` jbuu 直连成功→stderr 恰一行提示；F8 BOOK_MISMATCH→**不** fallback（协议错误 fail closed）。
+**E 组增补**：E6 `-c` e2e（serve+同目录三件套+`jbuu 127.0.0.1 -c 'echo hi; exit 7'`→stdout 含 hi、exit 7）；E7 `-c` 输出合流断言（`2>&1` 单流+CRLF）；E8 公网形态冒烟（`--listen [::]:7717` 于 CI loopback+`jbuu 127.0.0.1 --book` 连通；占口则 skip）；E9 ssh 经 7717 全链（假 sshd 回显）+审计行存在+警告行到达。
 
 ---
 
-## 12. 分期与实现卡建议
+## 16. 分期与实现卡建议（v2 重排）
 
 | 期 | 内容 | 规模 |
 |---|---|---|
-| P0 | 直连形态（位置参数+旗面+分派）、默认端口常量+覆盖链、同目录锚约定、serve 缺省监听变更、T/P5-6/E1-2 用例、帮助面首例 | ~1 人日 |
-| P1 | config.toml（toml/serde 依赖+deny 复核）、别名解析+捆绑规则、`--config`、C 组+E3/E4 | ~1.5 人日 |
-| P2 | `doctor --config` 校验、clap_complete 补全、runbook/README/示例文件增补、E5 | ~0.5 人日 |
+| P0' | v1 P0（直连形态/默认端口/同目录锚/serve 缺省）＋ **网关嗅探分流四旗标（§10，G1–G12）**＋ **`-c` 形态（§12，E6/E7）**——公网一等故事的服务端与最小客户端闭环 | ~2 人日 |
+| P1' | v1 P1（config.toml/别名/捆绑）＋ **`user` 字段**＋ **fallback 全套（§11，F1–F8）**＋ user@ 文法（T13） | ~1.5 人日 |
+| P2' | v1 P2（doctor --config/补全/文档）＋ **runbook v2 修订五项（§8.5）**＋ E8/E9 | ~1 人日 |
 
-建议**一张实现卡承载 P0+P1**（同一 CLI 表面拆卡会互相踩解析结构），P2 并入同卡尾部或另开小卡；芥末批注"后期"（定案②）由 P1 承接，P0 先行满足定案①。
+仍建议一张实现卡承载 P0'+P1'（同一 CLI 表面+serve 分流结构拆卡互踩），P2' 并尾或另开小卡。芥末"后期"（②）由 P1' 承接不变。
 
 ---
 
-## 13. 决策点汇总（提请芥末/评审逐条确认）
+## 17. 决策点汇总（v1 D1–D16 全保留；D17–D28 为 v2 新增，★=提请芥末拍板）
 
 | # | 决策 | 摘要 | 风险面 |
 |---|---|---|---|
-| D1 | 直连形态 | 顶层可选位置参数+connect 旗面，收敛 `run_connect` | 无（纯增量） |
-| D2 | 无参默认 | 帮助+exit 2，不隐式连接 | 用户体验预期 |
-| D3 | host 文法 | `host[:port]`/`[v6]:port`，无 `user@` | 与 ssh 习惯差一个 `user@`（无用户概念） |
-| D4 | 别名先于 DNS | ssh 同款 | 字面主机名撞别名时需删别名（极边角） |
-| D5 | connect 不解析别名 | 冻结面不加隐式行为 | `connect --target ops` 报"连接失败"需用户自学（§3.6 理由） |
-| D6 | 默认端口 7717 | 五准则+IANA 复核前置；备选 9778/15717 | 定值本身 |
-| D7 | 配置路径 | XDG 单文件，`--config` 覆盖 | 无系统级配置（多用户机各自维护） |
-| D8 | TOML+deny_unknown_fields | 新增 toml/serde 依赖 | 依赖树（cargo-deny 复核） |
-| D9 | schema 字段面 | §5.2 表；recover/allow_unencrypted_swap/full_otp 不收 | 少数 ssh 用户想要 recover 预设（会话态，拒绝） |
-| D10 | 凭据三件套捆绑 | 混配 fail early | 与 ssh 逐字段习惯不同（文档示例覆盖） |
-| D11 | 同目录锚约定+不自动创建 | 原文①只给 --book 的成立前提 | 布局不符者需显式给锚（报错指路） |
-| D12 | `--full-otp` 只登记不实现 | 并行卡所有 | 无 |
-| D13 | 不设 deprecation 时钟 | 直连/connect 长期并存 | 表面双入口（收敛同实现，成本低） |
-| D14 | serve 缺省监听 127.0.0.1:7717 | 唯一行为微变 | 同机双裸 serve 边角冲突 |
-| D15 | 端口二义拒绝 | `host:port`+`-p` 不等→exit 2 | 无 |
-| D16 | allow_unencrypted_swap 不入配置 | 降级须每次显式 | 高 swap 站点每台机器要敲 flag（安全收益优先） |
+| D1–D16 | （同 v1 §13 逐条：直连形态/无参默认/host 文法/别名先于 DNS/connect 不解析别名/端口 7717/XDG/TOML/schema 面捆绑/同目录锚/full-otp 登记/无 deprecation/serve 缺省/端口二义/降级不入配置） | 全部继承，无修改 | — |
+| D17 | 部署形态：公网 7717=一等，mesh=子集 | 依据芥末 09-15 ③原话；runbook 铁律作废（§9） | 公网暴露（→§13 移交门神） |
+| D18 | 网关内置 serve 进程（非独立二进制） | §10.1 三条理由 | 分流段代码纪律（G 组锁） |
+| D19 | 首包判别：首字节三分（`0x00`/`"SSH-"`/其余），校验全委托 codec | §10.2；version 演化不破坏判别 | 无（零新增解析面） |
+| **D20 ★** | **嗅探窗口 10s+并发上限 64（总窗口制）** | §10.2/§10.6；钳制 1..60 / 1..1024 | 值本身（窗口长=滞留资源；短=慢客户端误杀） |
+| **D21 ★** | **提醒通道=审计行（主）+预写警告行（尽力）+sshd Banner（部署件承重）；事件钩子否决；stderr 仅排障** | §10.3 定夺四通道+理由（wp14 E2 实证） | 触达率依赖 Banner 部署纪律 |
+| D22 | 网关 ssh 上游仅回环（启动校验拒绝非回环），默认 127.0.0.1:2222 | §10.7；wp14 D10 地址复用；nft 双保险 | 无 |
+| D23 | 第三协议/空首包/超时=关闭+审计，不回应不猜测 | §10.5 | 无 |
+| D24 | fallback 仅"默认端口 7717+传输层失败+未禁用+有 ssh"四条齐备；协议层错误绝不回落 | §11.1 | 显式端口用户遇 7717 宕需手动（最小惊讶优先） |
+| **D25 ★** | **fallback 探测超时 3s（不设旗标）** | §11.2 | 值本身（长=公网黑洞卡 3s；短=高延迟网络误判） |
+| D26 | `user@`：直连忽略+一行提示；仅 fallback 透传；别名增 user 字段 | §11.3/§11.4（芥末 09-15 落地形态） | 用户误以为 user 生效（提示行缓解，R5） |
+| D27 | `-c`：PTY 附着复用 WP-16 全链；stdout/stderr 合流如实声明；`--` 后不收 -c | §12.1/§12.2（芥末④落地形态） | 合流行为与 `ssh host cmd`（无 PTY）有差（声明+文档示例） |
+| D28 | `-c/user@/fallback` 仅直连面；connect 子命令零改动 | §3.5 破例表（零破坏总则） | 直连与 connect 表面不再严格同构（登记表显式化） |
 
-## 14. 偏差与解读细化申报（硬偏差=0）
+---
+
+## 18. 偏差与解读细化申报（v1 R1–R4 全保留；R5–R8 为 v2 新增；硬偏差=0）
 
 | # | 类型 | 内容 |
 |---|---|---|
-| R1 | 解读细化 | 定案①命令只出现 `--book`：锚由"同目录约定"补足（§6.3），非省略锚——锚仍是硬前提，只是缺省位置化 |
-| R2 | 解读细化 | "不带子命令直接走 connect"落为"顶层位置参数=host 的 connect 语义"；`connect` 子命令本身保留（零破坏总则） |
-| R3 | 解读细化 | 定案②"和 ssh 那样"取其**别名+身份文件映射**子集（§5.4 映射表），pattern/Include/ProxyJump 等明确不做（§3.6）；"其他的不变"以兼容矩阵（§8.1）兑现 |
-| R4 | 解读细化 | "后期"=P1 分期（§12），P0 只交付定案①；若芥末要求①②同期，P0+P1 一卡交付即可 |
+| R1–R4 | （同 v1 §14：同目录锚补足/"不带子命令"落为位置参数/定案②取子集/"后期"=P1） | 全部继承 |
+| R5 | 解读细化 | `user@` 在 jbuu 直连成功时**忽略但提示一行**（不静默）：芥末③授权的是"22 链路可用"，user 的唯一协议消费方是 ssh；提示防止用户误以为 user 参与了 jbuu 认证 |
+| R6 | 解读细化 | `-c` 的"附着 PTY"落为"复用 WP-16 PTY 机制 spawn `shell -c`"：任务卡④原文即 PTY 路线；合流/CRLF/isatty 三条行为差异如实声明（§12.1），不做无 PTY 管道形态（零 WP-16 触碰优先） |
+| R7 | 解读细化 | "自动探测 22"落为"仅当目标是默认端口 7717 且传输层失败"：显式端口=刻意选服务，静默换目标违最小惊讶；探测 3s 成功即 exec 系统 ssh（不内置 SSH 客户端） |
+| R8 | 解读细化 | "全时开放单口多协议"落为"7717 监听内嗅探分流恒开启（含 mesh 子集形态）"：与监听地址无关的单一代码路径；`--ssh-forward off` 提供站点级收面 |
 
 ——全文完——
